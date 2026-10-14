@@ -45,6 +45,7 @@ import sys
 import tempfile
 import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
 # Versioning & Constants
@@ -2799,132 +2800,127 @@ def generate_split(
         pool = mp.Pool(processes=cfg.workers, maxtasksperchild=250)
 
     try:
-        last_report_time = time.perf_counter()
         batch_size = max(1, min(cfg.workers * 4, 32))
 
-        while accepted < target_count and attempts < max_total_attempts and not _SHUTDOWN_REQUESTED:
-            enforce_resource_limits(
-                cfg.output_root, cfg.min_free_disk_mb, cfg.max_ram_mb
-            )
-
-            needed = target_count - accepted
-            cur_batch = min(batch_size, max_total_attempts - attempts, max(needed * 2, cfg.workers))
-            jobs: List[WorkerJob] = []
-
-            for i in range(cur_batch):
-                att_idx = attempts + i
-                # Deterministic sub-seed per attempt
-                att_seed = (split_seed * 6364136223846793005 + att_idx * 1442695040888963407 + 1) & 0x7FFFFFFFFFFFFFFF
-                sched_rng = random.Random(att_seed ^ 0xA5A5A5A5)
-                target_clues = sample_target_clues_for_curriculum(
-                    att_idx, sched_rng, spec, cfg.min_difficulty, cfg.max_difficulty
+        with tqdm(total=target_count, initial=accepted, desc=f"[{split_name.upper()}]", unit="puz") as pbar:
+            while accepted < target_count and attempts < max_total_attempts and not _SHUTDOWN_REQUESTED:
+                enforce_resource_limits(
+                    cfg.output_root, cfg.min_free_disk_mb, cfg.max_ram_mb
                 )
-                jobs.append(
-                    WorkerJob(
-                        split_name=split_name,
-                        attempt_index=att_idx,
-                        attempt_seed=att_seed,
-                        variant_name=spec.name,
-                        task_type_value=cfg.task_type,
-                        target_clues=target_clues,
-                        symmetry_mode="central",
-                        timeout_sec=timeout_sec,
-                        difficulty_step=cfg.difficulty_step,
-                        min_difficulty=cfg.min_difficulty,
-                        max_difficulty=cfg.max_difficulty,
-                        throttle_sec=throttle_sec,
+
+                needed = target_count - accepted
+                cur_batch = min(batch_size, max_total_attempts - attempts, max(needed * 2, cfg.workers))
+                jobs: List[WorkerJob] = []
+
+                for i in range(cur_batch):
+                    att_idx = attempts + i
+                    # Deterministic sub-seed per attempt
+                    att_seed = (split_seed * 6364136223846793005 + att_idx * 1442695040888963407 + 1) & 0x7FFFFFFFFFFFFFFF
+                    sched_rng = random.Random(att_seed ^ 0xA5A5A5A5)
+                    target_clues = sample_target_clues_for_curriculum(
+                        att_idx, sched_rng, spec, cfg.min_difficulty, cfg.max_difficulty
                     )
-                )
-
-            if pool is not None:
-                results = pool.map(_execute_worker_job, jobs)
-            else:
-                results = [_execute_worker_job(j) for j in jobs]
-
-            for res in results:
-                attempts += 1
-                solver_status_counts[res.solver_status] = (
-                    solver_status_counts.get(res.solver_status, 0) + 1
-                )
-
-                if not res.success or res.record is None:
-                    reason = res.rejection_reason or "unknown_rejection"
-                    rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
-                    continue
-
-                if accepted >= target_count:
-                    break
-
-                assert res.exact_hash is not None
-                assert res.canon_puz_hash is not None
-                assert res.family_hash is not None
-
-                is_unique_in_registry, leak_reason = dedup.check_and_register(
-                    split=split_name,
-                    puzzle_id=res.record["puzzle_id"],
-                    exact_hash=res.exact_hash,
-                    canon_puz_hash=res.canon_puz_hash,
-                    family_hash=res.family_hash,
-                )
-                if not is_unique_in_registry:
-                    reason = leak_reason or "duplicate_puzzle"
-                    rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
-                    continue
-
-                accepted += 1
-                final_rec = _reassign_sequence_index_and_rehash(res.record, accepted)
-
-                # Verify record before writing to disk
-                valid_rec, err_msg = verify_serialized_record(final_rec, spec)
-                if not valid_rec:
-                    rejection_counts["internal_serialization_error"] = (
-                        rejection_counts.get("internal_serialization_error", 0) + 1
+                    jobs.append(
+                        WorkerJob(
+                            split_name=split_name,
+                            attempt_index=att_idx,
+                            attempt_seed=att_seed,
+                            variant_name=spec.name,
+                            task_type_value=cfg.task_type,
+                            target_clues=target_clues,
+                            symmetry_mode="central",
+                            timeout_sec=timeout_sec,
+                            difficulty_step=cfg.difficulty_step,
+                            min_difficulty=cfg.min_difficulty,
+                            max_difficulty=cfg.max_difficulty,
+                            throttle_sec=throttle_sec,
+                        )
                     )
-                    accepted -= 1
-                    raise DatasetError(f"Generated record failed self-verification: {err_msg}")
 
-                part_file.write(json.dumps(final_rec, sort_keys=True) + "\n")
-
-                d_key = f"{float(final_rec['difficulty']):.1f}"
-                diff_hist[d_key] = diff_hist.get(d_key, 0) + 1
-                b_key = final_rec["difficulty_features"].get("difficulty_band", "unknown")
-                band_counts[b_key] = band_counts.get(b_key, 0) + 1
-                if final_rec["difficulty_features"].get("solved_by_logic_only", False):
-                    logic_cnt += 1
+                if pool is not None:
+                    results = pool.map(_execute_worker_job, jobs)
                 else:
-                    search_cnt += 1
+                    results = [_execute_worker_job(j) for j in jobs]
 
-                if accepted % cfg.checkpoint_interval == 0:
-                    part_file.flush()
-                    os.fsync(part_file.fileno())
-                    atomic_write_json(
-                        checkpoint_path,
-                        {
-                            "split_name": split_name,
-                            "config_fingerprint": fingerprint,
-                            "accepted_count": accepted,
-                            "target_count": target_count,
-                            "attempts": attempts,
-                            "rejection_counts": rejection_counts,
-                            "solver_status_counts": solver_status_counts,
-                            "timestamp_unix": time.time(),
-                        },
+                old_accepted = accepted
+                for res in results:
+                    attempts += 1
+                    solver_status_counts[res.solver_status] = (
+                        solver_status_counts.get(res.solver_status, 0) + 1
                     )
 
-            now = time.perf_counter()
-            if now - last_report_time >= 2.0 or accepted == target_count:
-                elapsed = max(1e-6, now - t0)
-                rate = accepted / elapsed
-                remaining = target_count - accepted
-                eta_str = f"{remaining / rate:.1f}s" if rate > 0 else "N/A"
+                    if not res.success or res.record is None:
+                        reason = res.rejection_reason or "unknown_rejection"
+                        rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+                        continue
+
+                    if accepted >= target_count:
+                        break
+
+                    assert res.exact_hash is not None
+                    assert res.canon_puz_hash is not None
+                    assert res.family_hash is not None
+
+                    is_unique_in_registry, leak_reason = dedup.check_and_register(
+                        split=split_name,
+                        puzzle_id=res.record["puzzle_id"],
+                        exact_hash=res.exact_hash,
+                        canon_puz_hash=res.canon_puz_hash,
+                        family_hash=res.family_hash,
+                    )
+                    if not is_unique_in_registry:
+                        reason = leak_reason or "duplicate_puzzle"
+                        rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+                        continue
+
+                    accepted += 1
+                    final_rec = _reassign_sequence_index_and_rehash(res.record, accepted)
+
+                    # Verify record before writing to disk
+                    valid_rec, err_msg = verify_serialized_record(final_rec, spec)
+                    if not valid_rec:
+                        rejection_counts["internal_serialization_error"] = (
+                            rejection_counts.get("internal_serialization_error", 0) + 1
+                        )
+                        accepted -= 1
+                        raise DatasetError(f"Generated record failed self-verification: {err_msg}")
+
+                    part_file.write(json.dumps(final_rec, sort_keys=True) + "\n")
+
+                    d_key = f"{float(final_rec['difficulty']):.1f}"
+                    diff_hist[d_key] = diff_hist.get(d_key, 0) + 1
+                    b_key = final_rec["difficulty_features"].get("difficulty_band", "unknown")
+                    band_counts[b_key] = band_counts.get(b_key, 0) + 1
+                    if final_rec["difficulty_features"].get("solved_by_logic_only", False):
+                        logic_cnt += 1
+                    else:
+                        search_cnt += 1
+
+                    if accepted % cfg.checkpoint_interval == 0:
+                        part_file.flush()
+                        os.fsync(part_file.fileno())
+                        atomic_write_json(
+                            checkpoint_path,
+                            {
+                                "split_name": split_name,
+                                "config_fingerprint": fingerprint,
+                                "accepted_count": accepted,
+                                "target_count": target_count,
+                                "attempts": attempts,
+                                "rejection_counts": rejection_counts,
+                                "solver_status_counts": solver_status_counts,
+                                "timestamp_unix": time.time(),
+                            },
+                        )
+
+                if accepted > old_accepted:
+                    pbar.update(accepted - old_accepted)
+                
                 sys_res = measure_system_resources(cfg.output_root)
-                log_fn(
-                    f"[{split_name.upper()}] Accepted: {accepted}/{target_count} | "
-                    f"Attempts: {attempts} | Rate: {rate:.1f} puz/s | "
-                    f"Est. Remaining: {eta_str} (advisory) | "
-                    f"Free Disk: {sys_res.free_disk_mb:.0f} MB"
+                pbar.set_postfix(
+                    attempts=attempts,
+                    free_disk_MB=f"{sys_res.free_disk_mb:.0f}"
                 )
-                last_report_time = now
 
         part_file.flush()
         os.fsync(part_file.fileno())
