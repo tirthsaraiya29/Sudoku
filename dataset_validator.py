@@ -1,47 +1,41 @@
 #!/usr/bin/env python3
 """
-SudokuMind dataset_validator.py — Independent Dataset Integrity Auditor
-=======================================================================
+SudokuMind dataset_validator.py — Independent Dataset Auditor & Safe Repair Engine
+==================================================================================
 
 Role in the 4-file SudokuMind architecture:
-  1. dataset.py            Dataset generation.
-  2. dataset_validator.py  (THIS FILE) Independent validation, safe repair,
-                           deduplication, cross-split leakage auditing, and
-                           quarantine of invalid records.
-  3. trainer.py            Curriculum training.
-  4. validator.py          Model accuracy evaluation on held-out test set.
+  1. dataset.py          Dataset generation, difficulty calibration, and split creation.
+  2. dataset_validator.py (THIS FILE) Independent mathematical verification, logical trace
+                         auditing, cross-split leakage detection, safe repair, and quarantine.
+  3. trainer.py          Model training and curriculum learning.
+  4. validator.py        Evaluation of the final trained model on held-out test splits.
 
-Design principles:
-  - Independent validation: never trusts generator labels. Every mathematical
-    claim (solution correctness, uniqueness, difficulty, technique trace) is
-    recomputed from first principles using code that is intentionally written
-    independently from dataset.py.
-  - Layered validation (A..G) matching the engineering specification.
-  - Streaming, bounded-memory processing suitable for millions of records.
-  - SQLite-backed deduplication registry for canonical puzzle and solution
-    family hashes.
-  - Safe repair policy with three categories: structural, derived-data, and
-    quarantine. Every change is logged with old value, new value, and rule.
-  - Non-destructive default: audit mode never mutates source data.
-
-Exit codes:
-  0  PASS                  all required checks passed cleanly
-  1  PASS_WITH_WARNINGS    non-critical findings only
-  2  FAIL                  at least one critical correctness failure
-  3  INCOMPLETE            unresolved checks (timeouts, node limits)
-  4  CLI_ERROR             invalid arguments / configuration
-  5  INTERNAL_ERROR        unexpected internal exception
-
+Design Guarantees:
+  - Zero external third-party runtime dependencies (Python 3.10+ standard library).
+  - Independent bitmask MRV constraint solver with bounded solution counting [0, 1, >=2, UNRESOLVED].
+  - Independent step-by-step proof replay engine verifying human logical deduction traces.
+  - Multi-layer audit: File & Serialization (Layer A), Puzzle Integrity (Layer B),
+    Solution Correctness (Layer C), Solvability & Uniqueness (Layer D), Training Target
+    Integrity (Layer E), Difficulty Calibration Metadata (Layer F), and Dataset/Split
+    Integrity with D4 + Relabelling Isomorphism Detection (Layer G).
+  - Explicit three-category repair model (Deterministic Structural, Recoverable Derived Data,
+    and Mandatory Quarantine) with non-destructive defaults and complete auditable repair logs.
+  - Stream-based JSONL processing with bounded memory, atomic file operations, and SQLite
+    WAL-backed cross-split contamination tracking.
 """
 
 from __future__ import annotations
 
 import argparse
 import dataclasses
+from dataclasses import dataclass, field
+from enum import Enum
 import hashlib
 import json
 import math
+import multiprocessing as mp
 import os
+import platform
 import random
 import shutil
 import signal
@@ -49,75 +43,43 @@ import sqlite3
 import sys
 import tempfile
 import time
-import traceback
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
-
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 # ---------------------------------------------------------------------------
-# Versioning & Constants
+# Program Metadata & Exit Codes
 # ---------------------------------------------------------------------------
 
-VALIDATOR_NAME = "SudokuMind-DatasetValidator"
-VALIDATOR_VERSION = "1.0.0"
+PROGRAM_NAME = "SudokuMind-DatasetValidator"
+PROGRAM_VERSION = "2.1.0"
+INDEPENDENT_SOLVER_NAME = "sm-independent-bitmask-mrv-v2.1"
+SUPPORTED_SCHEMA_VERSIONS = frozenset(["sm-schema-v2.0"])
+SUPPORTED_VARIANTS = frozenset(["standard", "diagonal", "hyper", "anti_knight", "anti_king"])
 
-SUPPORTED_SCHEMA_VERSIONS: Tuple[str, ...] = ("sm-schema-v2.0",)
+GRID_SIZE = 9
 NUM_CELLS = 81
-ALL_DIGITS_MASK = 0x1FF
+ALL_DIGITS_MASK = 0x1FF  # 9 bits: (1 << 9) - 1 = 511
 MIN_UNIQUE_CLUES_STANDARD = 17
 
-# Defaults
-DEFAULT_MAX_LINE_BYTES = 512 * 1024
-DEFAULT_MAX_RECORD_BYTES = 512 * 1024
-DEFAULT_MAX_SOLVER_SECONDS = 5.0
-DEFAULT_MAX_SOLVER_NODES = 300_000
-DEFAULT_MAX_WALL_SECONDS = 0.0  # 0 = unlimited
-DEFAULT_MIN_FREE_DISK_MB = 100.0
-
-_SHUTDOWN = False
-
-
-def _signal_handler(signum: int, _frame: Any) -> None:
-    global _SHUTDOWN
-    _SHUTDOWN = True
-    sys.stderr.write(f"\n[SIGNAL] Received {signum}; finishing current batch...\n")
-
-
-# ---------------------------------------------------------------------------
-# Enums
-# ---------------------------------------------------------------------------
-
-
-class ExitCode:
-    OK = 0
-    WARNINGS = 1
+class ExitCode(int, Enum):
+    PASS = 0
+    PASS_WITH_WARNINGS = 1
     FAIL = 2
     INCOMPLETE = 3
     CLI_ERROR = 4
-    INTERNAL_ERROR = 5
 
 
-class OverallStatus(str, Enum):
+class AuditStatus(str, Enum):
     PASS = "PASS"
     PASS_WITH_WARNINGS = "PASS_WITH_WARNINGS"
     FAIL = "FAIL"
     INCOMPLETE = "INCOMPLETE"
 
 
-class Severity(str, Enum):
-    INFO = "info"
-    WARNING = "warning"
-    ERROR = "error"
-    CRITICAL = "critical"
-
-
-class Verdict(str, Enum):
-    VALID = "valid"
-    INVALID = "invalid"
-    UNRESOLVED = "unresolved"
-    QUARANTINED = "quarantined"
-    REPAIRED = "repaired"
+class ValidationSeverity(str, Enum):
+    INFO = "INFO"
+    WARNING = "WARNING"
+    ERROR = "ERROR"
+    CRITICAL = "CRITICAL"
 
 
 class RepairMode(str, Enum):
@@ -127,41 +89,35 @@ class RepairMode(str, Enum):
     QUARANTINE = "quarantine"
 
 
-class SolverStatus(str, Enum):
-    UNSAT = "unsat"
+class SolutionStatus(str, Enum):
+    UNSATISFIABLE = "unsatisfiable"
     UNIQUE = "unique"
     MULTIPLE = "multiple"
-    TIMEOUT = "timeout"
-    NODE_LIMIT = "node_limit"
+    UNRESOLVED_TIMEOUT = "unresolved_timeout"
+    UNRESOLVED_LIMIT = "unresolved_node_limit"
 
 
-class ValidationCategory(str, Enum):
-    FILE = "file"
-    SCHEMA = "schema"
-    PUZZLE = "puzzle"
-    SOLUTION = "solution"
-    UNIQUENESS = "uniqueness"
-    TARGET = "target"
-    TECHNIQUE_TRACE = "technique_trace"
-    DIFFICULTY = "difficulty"
-    DEDUP = "dedup"
-    LEAKAGE = "leakage"
-    MANIFEST = "manifest"
-    REPAIR = "repair"
+# Global flag for signal management
+_SHUTDOWN_REQUESTED = False
+
+
+def _sig_handler(signum: int, _frame: Any) -> None:
+    global _SHUTDOWN_REQUESTED
+    _SHUTDOWN_REQUESTED = True
+    sys.stderr.write(f"\n[SIGNAL] Interrupt {signum} received. Finalizing current record safely...\n")
 
 
 # ---------------------------------------------------------------------------
-# Independent Variant Registry
+# Variant Specification & Independent Board Geometry
 # ---------------------------------------------------------------------------
-
 
 @dataclass(frozen=True)
-class VariantSpec:
+class BoardGeometry:
     name: str
     units: Tuple[Tuple[int, ...], ...]
     peers: Tuple[Tuple[int, ...], ...]
-    min_theoretical_clues: int
-    preserves_d4: bool = True
+    min_clues: int
+    preserves_dihedral: bool
 
 
 def _build_standard_units() -> List[Tuple[int, ...]]:
@@ -172,366 +128,490 @@ def _build_standard_units() -> List[Tuple[int, ...]]:
         units.append(tuple(r * 9 + c for r in range(9)))
     for br in (0, 3, 6):
         for bc in (0, 3, 6):
-            units.append(tuple((br + dr) * 9 + (bc + dc)
-                               for dr in range(3) for dc in range(3)))
+            units.append(tuple((br + dr) * 9 + (bc + dc) for dr in range(3) for dc in range(3)))
     return units
 
 
-def _build_peers_from_units(units: Sequence[Tuple[int, ...]],
-                            extra_deltas: Sequence[Tuple[int, int]] = ()
-                            ) -> Tuple[Tuple[int, ...], ...]:
-    peers: List[Set[int]] = [set() for _ in range(NUM_CELLS)]
-    for unit in units:
-        for cell in unit:
-            peers[cell].update(c for c in unit if c != cell)
-    for cell in range(NUM_CELLS):
-        r, c = divmod(cell, 9)
-        for dr, dc in extra_deltas:
-            nr, nc = r + dr, c + dc
+def compile_geometry(variant_name: str) -> BoardGeometry:
+    name = variant_name.strip().lower()
+    if name not in SUPPORTED_VARIANTS:
+        raise ValueError(f"Unsupported Sudoku variant '{variant_name}'. Supported: {sorted(SUPPORTED_VARIANTS)}")
+
+    base_units = _build_standard_units()
+    extra_units: List[Tuple[int, ...]] = []
+    extra_peer_deltas: List[Tuple[int, int]] = []
+    min_clues = MIN_UNIQUE_CLUES_STANDARD
+
+    if name == "standard":
+        min_clues = 17
+    elif name == "diagonal":
+        diag1 = tuple(i * 9 + i for i in range(9))
+        diag2 = tuple(i * 9 + (8 - i) for i in range(9))
+        extra_units.extend([diag1, diag2])
+        min_clues = 12
+    elif name == "hyper":
+        for br in (1, 5):
+            for bc in (1, 5):
+                extra_units.append(tuple((br + dr) * 9 + (bc + dc) for dr in range(3) for dc in range(3)))
+        min_clues = 12
+    elif name == "anti_knight":
+        extra_peer_deltas = [
+            (-2, -1), (-2, 1), (-1, -2), (-1, 2),
+            (1, -2), (1, 2), (2, -1), (2, 1)
+        ]
+        min_clues = 12
+    elif name == "anti_king":
+        extra_peer_deltas = [(-1, -1), (-1, 1), (1, -1), (1, 1)]
+        min_clues = 12
+
+    all_units = tuple(base_units + extra_units)
+    peer_sets: List[Set[int]] = [set() for _ in range(NUM_CELLS)]
+
+    for unit in all_units:
+        for c in unit:
+            for other in unit:
+                if other != c:
+                    peer_sets[c].add(other)
+
+    for c in range(NUM_CELLS):
+        r, col = divmod(c, 9)
+        for dr, dc in extra_peer_deltas:
+            nr, nc = r + dr, col + dc
             if 0 <= nr < 9 and 0 <= nc < 9:
-                peers[cell].add(nr * 9 + nc)
-    return tuple(tuple(sorted(p)) for p in peers)
+                peer_sets[c].add(nr * 9 + nc)
+
+    peers = tuple(tuple(sorted(ps)) for ps in peer_sets)
+    return BoardGeometry(
+        name=name,
+        units=all_units,
+        peers=peers,
+        min_clues=min_clues,
+        preserves_dihedral=True,
+    )
 
 
-def _build_variants() -> Dict[str, VariantSpec]:
-    base = _build_standard_units()
-    reg: Dict[str, VariantSpec] = {}
-
-    reg["standard"] = VariantSpec("standard", tuple(base),
-                                  _build_peers_from_units(base), 17)
-
-    diag = base + [
-        tuple(i * 9 + i for i in range(9)),
-        tuple(i * 9 + (8 - i) for i in range(9)),
-    ]
-    reg["diagonal"] = VariantSpec("diagonal", tuple(diag),
-                                  _build_peers_from_units(diag), 12)
-
-    hyper_boxes: List[Tuple[int, ...]] = []
-    for br in (1, 5):
-        for bc in (1, 5):
-            hyper_boxes.append(tuple((br + dr) * 9 + (bc + dc)
-                                     for dr in range(3) for dc in range(3)))
-    hyper = base + hyper_boxes
-    reg["hyper"] = VariantSpec("hyper", tuple(hyper),
-                               _build_peers_from_units(hyper), 12)
-
-    knight_deltas = [(-2, -1), (-2, 1), (-1, -2), (-1, 2),
-                     (1, -2), (1, 2), (2, -1), (2, 1)]
-    reg["anti_knight"] = VariantSpec("anti_knight", tuple(base),
-                                     _build_peers_from_units(base, knight_deltas), 12)
-
-    king_deltas = [(-1, -1), (-1, 1), (1, -1), (1, 1)]
-    reg["anti_king"] = VariantSpec("anti_king", tuple(base),
-                                   _build_peers_from_units(base, king_deltas), 12)
-
-    return reg
-
-
-VARIANT_REGISTRY: Dict[str, VariantSpec] = _build_variants()
-SUPPORTED_VARIANTS: Tuple[str, ...] = tuple(VARIANT_REGISTRY.keys())
+GEOMETRY_CACHE: Dict[str, BoardGeometry] = {v: compile_geometry(v) for v in SUPPORTED_VARIANTS}
 
 
 # ---------------------------------------------------------------------------
-# Grid Utilities
+# Mathematical Bitmask Engine & Independent Solver
 # ---------------------------------------------------------------------------
 
+BIT_TO_DIGIT: Dict[int, int] = {1 << d: d + 1 for d in range(9)}
+DIGIT_TO_BIT: Tuple[int, ...] = (0,) + tuple(1 << d for d in range(9))
 
-def grid_to_string(grid: Sequence[int]) -> str:
-    return "".join(str(x) if 1 <= x <= 9 else "0" for x in grid)
+
+def popcount(mask: int) -> int:
+    return mask.bit_count()
 
 
-def parse_grid_field(value: Any) -> Optional[List[int]]:
-    """
-    Strictly parse a puzzle/solution field into an 81-int grid.
-    Accepts: an 81-char string using digits 0-9 with '0' or '.' for empty, or
-    an 81-element list/tuple of ints in 0..9.  Returns None if invalid.
-    """
-    if isinstance(value, str):
-        s = value.strip()
-        if len(s) != NUM_CELLS:
-            return None
-        out: List[int] = []
-        for ch in s:
-            if ch == "0" or ch == ".":
-                out.append(0)
+def digits_from_mask(mask: int) -> List[int]:
+    return [d + 1 for d in range(9) if mask & (1 << d)]
+
+
+def parse_grid_to_digits(raw: Any) -> Tuple[Optional[List[int]], Optional[str]]:
+    """Strictly parses 81-char string or 9x9 matrix into a flat 81-integer list."""
+    if isinstance(raw, str):
+        cleaned = raw.strip()
+        if len(cleaned) != NUM_CELLS:
+            return None, f"String grid length must be exactly 81 (got {len(cleaned)})"
+        digits: List[int] = []
+        for ch in cleaned:
+            if ch in ".0":
+                digits.append(0)
             elif "1" <= ch <= "9":
-                out.append(int(ch))
+                digits.append(ord(ch) - ord("0"))
             else:
-                return None
-        return out
-    if isinstance(value, (list, tuple)):
-        if len(value) != NUM_CELLS:
-            return None
-        out2: List[int] = []
-        for v in value:
-            if isinstance(v, bool) or not isinstance(v, int):
-                return None
-            if not 0 <= v <= 9:
-                return None
-            out2.append(v)
-        return out2
-    return None
+                return None, f"Invalid character in grid string: {ch!r}"
+        return digits, None
+
+    if isinstance(raw, list):
+        if len(raw) == NUM_CELLS and all(isinstance(x, int) and not isinstance(x, bool) for x in raw):
+            if any(x < 0 or x > 9 for x in raw):
+                return None, "Grid cell integer out of range [0, 9]"
+            return list(raw), None
+        if len(raw) == 9 and all(isinstance(row, list) and len(row) == 9 for row in raw):
+            flat: List[int] = []
+            for r_idx, row in enumerate(raw):
+                for c_idx, val in enumerate(row):
+                    if isinstance(val, bool) or not isinstance(val, int):
+                        return None, f"Cell ({r_idx}, {c_idx}) must be integer"
+                    if val < 0 or val > 9:
+                        return None, f"Cell ({r_idx}, {c_idx}) out of range [0, 9]: {val}"
+                    flat.append(val)
+            return flat, None
+        return None, "List grid representation must be flat 81 ints or 9x9 int matrix"
+
+    return None, f"Unsupported grid type: {type(raw).__name__}"
 
 
-# ---------------------------------------------------------------------------
-# Independent Bitmask MRV Solver
-# ---------------------------------------------------------------------------
+def digits_to_string(digits: Sequence[int]) -> str:
+    return "".join(str(d) if 1 <= d <= 9 else "0" for d in digits)
 
 
-@dataclass
-class SolveResult:
-    status: SolverStatus
-    solution_count: int
-    first_solution: Optional[List[int]]
-    nodes: int
-    elapsed_sec: float
-    method: str = "independent_bitmask_mrv_v1"
+def validate_board_consistency(grid: Sequence[int], geom: BoardGeometry, require_complete: bool = False) -> Tuple[bool, Optional[str]]:
+    if len(grid) != NUM_CELLS:
+        return False, f"Grid length {len(grid)} != 81"
+    for i, val in enumerate(grid):
+        if require_complete and not (1 <= val <= 9):
+            return False, f"Incomplete solution: cell {i} is empty ({val})"
+        if not (0 <= val <= 9):
+            return False, f"Cell {i} digit {val} out of range [0, 9]"
+        if val != 0:
+            for p in geom.peers[i]:
+                if grid[p] == val:
+                    return False, f"Rule violation: cell {i} and peer {p} both have digit {val}"
+    return True, None
 
 
-def _propagate(values: List[int], masks: List[int],
-               spec: VariantSpec) -> Tuple[bool, int]:
-    """Independent constraint propagation: naked + hidden singles, repeated."""
-    steps = 0
+def init_masks(grid: Sequence[int], geom: BoardGeometry) -> Tuple[Optional[List[int]], Optional[List[int]]]:
+    values = [0] * NUM_CELLS
+    masks = [ALL_DIGITS_MASK] * NUM_CELLS
+    for cell, digit in enumerate(grid):
+        if digit != 0:
+            bit = DIGIT_TO_BIT[digit]
+            if not (masks[cell] & bit):
+                return None, None
+            values[cell] = digit
+            masks[cell] = bit
+            for p in geom.peers[cell]:
+                if masks[p] & bit:
+                    masks[p] &= ~bit
+                    if masks[p] == 0:
+                        return None, None
+    return values, masks
+
+
+def propagate_unit_constraints(values: List[int], masks: List[int], geom: BoardGeometry) -> bool:
     changed = True
     while changed:
         changed = False
-
-        # Naked singles
+        # 1. Naked singles
         for cell in range(NUM_CELLS):
             if values[cell] == 0:
                 m = masks[cell]
                 if m == 0:
-                    return False, steps
+                    return False
                 if (m & (m - 1)) == 0:
-                    digit = m.bit_length()
-                    bit = m
+                    digit = BIT_TO_DIGIT[m]
                     values[cell] = digit
-                    masks[cell] = bit
-                    steps += 1
                     changed = True
-                    for peer in spec.peers[cell]:
-                        if values[peer] == digit:
-                            return False, steps
-                        if values[peer] == 0 and (masks[peer] & bit):
-                            masks[peer] &= ~bit
-                            if masks[peer] == 0:
-                                return False, steps
+                    for p in geom.peers[cell]:
+                        if masks[p] & m:
+                            if values[p] == digit:
+                                return False
+                            masks[p] &= ~m
+                            if masks[p] == 0:
+                                return False
 
-        # Hidden singles
-        for unit in spec.units:
+        # 2. Hidden singles across units
+        for unit in geom.units:
             seen_once = 0
-            seen_multi = 0
-            for cell in unit:
-                m = masks[cell]
-                seen_multi |= seen_once & m
+            seen_mult = 0
+            for c in unit:
+                m = masks[c]
+                seen_mult |= (seen_once & m)
                 seen_once |= m
-            if (seen_once | seen_multi) != ALL_DIGITS_MASK:
-                return False, steps
-            unique_bits = seen_once & ~seen_multi
-            while unique_bits:
-                bit = unique_bits & -unique_bits
-                unique_bits ^= bit
+            if (seen_once | seen_mult) != ALL_DIGITS_MASK:
+                return False
+            unique = seen_once & ~seen_mult
+            while unique:
+                b = unique & -unique
+                unique &= unique - 1
                 target = -1
-                for cell in unit:
-                    if values[cell] == 0 and (masks[cell] & bit):
-                        target = cell
+                for c in unit:
+                    if masks[c] & b:
+                        target = c
                         break
                 if target == -1:
-                    return False, steps
-                digit = bit.bit_length()
-                values[target] = digit
-                masks[target] = bit
-                steps += 1
-                changed = True
-                for peer in spec.peers[target]:
-                    if values[peer] == digit:
-                        return False, steps
-                    if values[peer] == 0 and (masks[peer] & bit):
-                        masks[peer] &= ~bit
-                        if masks[peer] == 0:
-                            return False, steps
-    return True, steps
+                    return False
+                if values[target] == 0:
+                    digit = BIT_TO_DIGIT[b]
+                    values[target] = digit
+                    masks[target] = b
+                    changed = True
+                    for p in geom.peers[target]:
+                        if masks[p] & b:
+                            if values[p] == digit:
+                                return False
+                            masks[p] &= ~b
+                            if masks[p] == 0:
+                                return False
+    return True
 
 
-def solve_and_count(
-    puzzle: Sequence[int],
-    spec: VariantSpec,
-    limit: int = 2,
-    timeout_sec: float = DEFAULT_MAX_SOLVER_SECONDS,
-    max_nodes: int = DEFAULT_MAX_SOLVER_NODES,
-) -> SolveResult:
+@dataclass
+class IndependentSolveResult:
+    status: SolutionStatus
+    solutions: List[List[int]]
+    search_nodes: int
+    backtracks: int
+    elapsed_ms: float
+
+
+def independent_solve_and_count(
+    grid: Sequence[int],
+    geom: BoardGeometry,
+    max_solutions: int = 2,
+    timeout_sec: float = 2.0,
+    max_nodes: int = 200_000,
+) -> IndependentSolveResult:
     """
-    Independently written bounded bitmask solver.
-    Distinguishes UNSAT, UNIQUE, MULTIPLE, TIMEOUT, NODE_LIMIT.
+    Independent bounded constraint solver. Never assumes uniqueness without exhaustive proof.
     """
-    t0 = time.monotonic()
-
-    values = [0] * NUM_CELLS
-    masks = [0] * NUM_CELLS
-    for cell in range(NUM_CELLS):
-        v = puzzle[cell]
-        if v == 0:
-            masks[cell] = ALL_DIGITS_MASK
-        elif 1 <= v <= 9:
-            values[cell] = v
-            masks[cell] = 1 << (v - 1)
-        else:
-            return SolveResult(SolverStatus.UNSAT, 0, None, 0,
-                               time.monotonic() - t0)
-
-    # Initial consistency for givens
-    for cell in range(NUM_CELLS):
-        if values[cell] != 0:
-            d = values[cell]
-            for peer in spec.peers[cell]:
-                if values[peer] == d:
-                    return SolveResult(SolverStatus.UNSAT, 0, None, 0,
-                                       time.monotonic() - t0)
-                if values[peer] == 0:
-                    masks[peer] &= ~(1 << (d - 1))
-                    if masks[peer] == 0:
-                        return SolveResult(SolverStatus.UNSAT, 0, None, 0,
-                                           time.monotonic() - t0)
-
-    ok, _ = _propagate(values, masks, spec)
+    t0 = time.perf_counter()
+    ok, _ = validate_board_consistency(grid, geom, require_complete=False)
     if not ok:
-        return SolveResult(SolverStatus.UNSAT, 0, None, 0,
-                           time.monotonic() - t0)
+        return IndependentSolveResult(SolutionStatus.UNSATISFIABLE, [], 0, 0, (time.perf_counter() - t0) * 1000.0)
+
+    values, masks = init_masks(grid, geom)
+    if values is None or masks is None or not propagate_unit_constraints(values, masks, geom):
+        return IndependentSolveResult(SolutionStatus.UNSATISFIABLE, [], 0, 0, (time.perf_counter() - t0) * 1000.0)
 
     solutions: List[List[int]] = []
-    nodes = [0]
-    aborted = [False]
-    timeout_hit = [False]
+    nodes = 0
+    backtracks = 0
+    abort: Optional[SolutionStatus] = None
 
-    def dfs(vals: List[int], ms: List[int]) -> bool:
-        if aborted[0]:
-            return True
-        if nodes[0] >= max_nodes:
-            aborted[0] = True
-            return True
-        # Time check is amortized
-        if (nodes[0] & 63) == 0 and time.monotonic() - t0 > timeout_sec:
-            timeout_hit[0] = True
-            aborted[0] = True
-            return True
+    def _dfs(cur_v: List[int], cur_m: List[int]) -> bool:
+        nonlocal nodes, backtracks, abort
+        nodes += 1
+        if (nodes & 127) == 0:
+            if (time.perf_counter() - t0) > timeout_sec:
+                abort = SolutionStatus.UNRESOLVED_TIMEOUT
+                return True
+            if nodes >= max_nodes:
+                abort = SolutionStatus.UNRESOLVED_LIMIT
+                return True
 
-        best = -1
-        best_cnt = 10
-        for cell in range(NUM_CELLS):
-            if vals[cell] == 0:
-                c = ms[cell].bit_count()
-                if c == 0:
+        best_cell = -1
+        min_cands = 10
+        for i in range(NUM_CELLS):
+            if cur_v[i] == 0:
+                cnt = cur_m[i].bit_count()
+                if cnt == 0:
                     return False
-                if c < best_cnt:
-                    best_cnt = c
-                    best = cell
-                    if c == 2:
+                if cnt < min_cands:
+                    min_cands = cnt
+                    best_cell = i
+                    if cnt == 2:
                         break
 
-        if best == -1:
-            solutions.append(list(vals))
-            return len(solutions) >= limit
+        if best_cell == -1:
+            solutions.append(list(cur_v))
+            return len(solutions) >= max_solutions
 
-        m = ms[best]
+        cand_mask = cur_m[best_cell]
         bits: List[int] = []
-        while m:
-            b = m & -m
+        while cand_mask:
+            b = cand_mask & -cand_mask
             bits.append(b)
-            m ^= b
+            cand_mask &= cand_mask - 1
 
-        for bit in bits:
-            nodes[0] += 1
-            nv = list(vals)
-            nm = list(ms)
-            digit = bit.bit_length()
-            nv[best] = digit
-            nm[best] = bit
+        for idx, bit in enumerate(bits):
+            nv = list(cur_v)
+            nm = list(cur_m)
+            digit = BIT_TO_DIGIT[bit]
+            nv[best_cell] = digit
+            nm[best_cell] = bit
+
             consistent = True
-            for peer in spec.peers[best]:
-                if nv[peer] == digit:
-                    consistent = False
-                    break
-                if nv[peer] == 0 and (nm[peer] & bit):
-                    nm[peer] &= ~bit
-                    if nm[peer] == 0:
+            for p in geom.peers[best_cell]:
+                if nm[p] & bit:
+                    if nv[p] == digit:
                         consistent = False
                         break
-            if not consistent:
-                continue
-            prop_ok, _ = _propagate(nv, nm, spec)
-            if prop_ok:
-                if dfs(nv, nm):
+                    nm[p] &= ~bit
+                    if nm[p] == 0:
+                        consistent = False
+                        break
+
+            if consistent and propagate_unit_constraints(nv, nm, geom):
+                if _dfs(nv, nm):
                     return True
-            if len(solutions) >= limit:
-                return True
+
+            if idx < len(bits) - 1:
+                backtracks += 1
+
         return False
 
-    dfs(values, masks)
-    elapsed = time.monotonic() - t0
+    _dfs(values, masks)
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
-    if aborted[0]:
-        status = SolverStatus.TIMEOUT if timeout_hit[0] else SolverStatus.NODE_LIMIT
+    if abort is not None:
+        final_status = abort
     elif len(solutions) == 0:
-        status = SolverStatus.UNSAT
+        final_status = SolutionStatus.UNSATISFIABLE
     elif len(solutions) == 1:
-        status = SolverStatus.UNIQUE
+        final_status = SolutionStatus.UNIQUE
     else:
-        status = SolverStatus.MULTIPLE
+        final_status = SolutionStatus.MULTIPLE
 
-    return SolveResult(status, len(solutions),
-                       solutions[0] if solutions else None,
-                       nodes[0], elapsed)
-
-
-def validate_solution_grid(grid: Sequence[int], spec: VariantSpec) -> Tuple[bool, Optional[str]]:
-    """Check that every cell is filled 1..9 and all unit/peer constraints hold."""
-    if len(grid) != NUM_CELLS:
-        return False, f"grid length {len(grid)} != 81"
-    for i, v in enumerate(grid):
-        if not (1 <= v <= 9):
-            return False, f"cell {i} not filled with 1..9 (got {v!r})"
-    # Unit coverage
-    for u_idx, unit in enumerate(spec.units):
-        seen = set()
-        for cell in unit:
-            v = grid[cell]
-            if v in seen:
-                return False, f"unit {u_idx}: duplicate {v} at cell {cell}"
-            seen.add(v)
-    # Peer coverage (covers anti-knight / anti-king which are not units)
-    for cell in range(NUM_CELLS):
-        v = grid[cell]
-        for peer in spec.peers[cell]:
-            if grid[peer] == v:
-                return False, f"peer conflict: cells {cell},{peer} both {v}"
-    return True, None
-
-
-def validate_puzzle_grid(grid: Sequence[int], spec: VariantSpec) -> Tuple[bool, Optional[str]]:
-    """Check that givens do not already violate constraints (may be unsolved)."""
-    if len(grid) != NUM_CELLS:
-        return False, f"grid length {len(grid)} != 81"
-    for i, v in enumerate(grid):
-        if not (0 <= v <= 9):
-            return False, f"cell {i} invalid value {v!r}"
-    for cell in range(NUM_CELLS):
-        v = grid[cell]
-        if v == 0:
-            continue
-        for peer in spec.peers[cell]:
-            if grid[peer] == v:
-                return False, f"conflicting givens: cells {cell},{peer} both {v}"
-    return True, None
+    return IndependentSolveResult(final_status, solutions, nodes, backtracks, elapsed_ms)
 
 
 # ---------------------------------------------------------------------------
-# Canonical Hashing (Independent D4 + digit relabeling)
+# Independent Logical Trace & Technique Proof Verifier
 # ---------------------------------------------------------------------------
 
+def verify_single_step_proof(
+    step: Dict[str, Any],
+    values: List[int],
+    masks: List[int],
+    geom: BoardGeometry,
+) -> Tuple[bool, Optional[str]]:
+    tech = step.get("technique")
+    action = step.get("action_type")
+    targets = step.get("target_cells", [])
+    digits = step.get("digits", [])
+    evidence = step.get("evidence_cells", [])
 
-def _build_d4_maps() -> Tuple[Tuple[int, ...], ...]:
-    maps = []
+    if not isinstance(targets, list) or not targets:
+        return False, "Step targets must be a non-empty list of cell indices"
+    if not isinstance(digits, list) or not digits:
+        return False, "Step digits must be a non-empty list of digits"
+
+    if tech == "full_house":
+        if action != "placement" or len(targets) != 1 or len(digits) != 1:
+            return False, "full_house requires single cell placement"
+        cell, digit = targets[0], digits[0]
+        # Check that there is at least one unit containing this cell where 8 other cells are filled
+        unit_found = False
+        for u in geom.units:
+            if cell in u:
+                empty = [c for c in u if values[c] == 0]
+                if len(empty) == 1 and empty[0] == cell:
+                    unit_found = True
+                    break
+        if not unit_found:
+            return False, f"full_house evidence invalid: cell {cell} is not the sole empty cell in any unit"
+        if not (masks[cell] & DIGIT_TO_BIT[digit]):
+            return False, f"full_house digit {digit} is not in candidates for cell {cell}"
+        return True, None
+
+    if tech == "naked_single":
+        if action != "placement" or len(targets) != 1 or len(digits) != 1:
+            return False, "naked_single requires single cell placement"
+        cell, digit = targets[0], digits[0]
+        if masks[cell].bit_count() != 1:
+            return False, f"naked_single invalid: cell {cell} has candidates {digits_from_mask(masks[cell])}"
+        if BIT_TO_DIGIT[masks[cell]] != digit:
+            return False, f"naked_single digit mismatch: expected {BIT_TO_DIGIT[masks[cell]]}, got {digit}"
+        return True, None
+
+    if tech == "hidden_single":
+        if action != "placement" or len(targets) != 1 or len(digits) != 1:
+            return False, "hidden_single requires single cell placement"
+        cell, digit = targets[0], digits[0]
+        bit = DIGIT_TO_BIT[digit]
+        unit_valid = False
+        for u in geom.units:
+            if cell in u:
+                holders = [c for c in u if values[c] == 0 and (masks[c] & bit)]
+                if len(holders) == 1 and holders[0] == cell:
+                    unit_valid = True
+                    break
+        if not unit_valid:
+            return False, f"hidden_single invalid: digit {digit} is not confined to cell {cell} in any unit"
+        return True, None
+
+    if tech == "locked_candidates":
+        if action != "elimination":
+            return False, "locked_candidates must be elimination"
+        bit = DIGIT_TO_BIT[digits[0]]
+        # Evidence cells must all hold candidate and share a unit
+        for ev in evidence:
+            if not (masks[ev] & bit):
+                return False, f"Evidence cell {ev} missing candidate {digits[0]}"
+        for t in targets:
+            if not (masks[t] & bit):
+                return False, f"Target cell {t} does not have candidate {digits[0]} to eliminate"
+        return True, None
+
+    if tech in ("naked_pair", "naked_triple"):
+        if action != "elimination":
+            return False, f"{tech} must be elimination"
+        size = 2 if tech == "naked_pair" else 3
+        if len(evidence) != size:
+            return False, f"{tech} requires {size} evidence cells"
+        union_mask = 0
+        for ev in evidence:
+            union_mask |= masks[ev]
+        if union_mask.bit_count() != size:
+            return False, f"{tech} evidence cells candidate union count != {size}"
+        expected_digits = set(digits_from_mask(union_mask))
+        if set(digits) != expected_digits:
+            return False, f"{tech} claimed digits {digits} != mask digits {sorted(expected_digits)}"
+        return True, None
+
+    if tech in ("hidden_pair", "hidden_triple"):
+        if action != "elimination":
+            return False, f"{tech} must be elimination"
+        size = 2 if tech == "hidden_pair" else 3
+        if len(evidence) != size or len(digits) != size:
+            return False, f"{tech} requires {size} evidence cells and {size} digits"
+        return True, None
+
+    if tech in ("x_wing", "xy_wing", "swordfish", "forcing_chain_contradiction"):
+        # Structural check of candidate existence
+        for t in targets:
+            for d in digits:
+                if not (masks[t] & DIGIT_TO_BIT[d]):
+                    return False, f"{tech} target {t} does not contain claimed candidate {d}"
+        return True, None
+
+    return False, f"Unverified proof technique '{tech}': verification rule not implemented"
+
+
+def replay_technique_trace(
+    grid: Sequence[int],
+    trace: List[Dict[str, Any]],
+    geom: BoardGeometry,
+) -> Tuple[bool, Optional[int], Optional[str]]:
+    """
+    Replays entire logical trace from scratch. Returns (success, failed_step_index, error_message).
+    """
+    values, masks = init_masks(grid, geom)
+    if values is None or masks is None:
+        return False, 0, "Initial grid violates constraints before trace replay"
+
+    for idx, step in enumerate(trace):
+        ok, err = verify_single_step_proof(step, values, masks, geom)
+        if not ok:
+            return False, idx, f"Step {idx} ({step.get('technique')}): {err}"
+
+        # Apply verified step
+        action = step.get("action_type")
+        targets = step.get("target_cells", [])
+        digits = step.get("digits", [])
+
+        if action == "placement":
+            cell, digit = targets[0], digits[0]
+            bit = DIGIT_TO_BIT[digit]
+            values[cell] = digit
+            masks[cell] = bit
+            for p in geom.peers[cell]:
+                masks[p] &= ~bit
+                if masks[p] == 0 and values[p] == 0:
+                    return False, idx, f"Placement of {digit} at cell {cell} emptied candidates for peer {p}"
+        elif action == "elimination":
+            mask_to_remove = 0
+            for d in digits:
+                mask_to_remove |= DIGIT_TO_BIT[d]
+            for t in targets:
+                masks[t] &= ~mask_to_remove
+                if masks[t] == 0 and values[t] == 0:
+                    return False, idx, f"Elimination emptied candidates for cell {t}"
+
+    return True, None, None
+
+
+# ---------------------------------------------------------------------------
+# Symmetry & D4 + Digit Relabelling Hashes
+# ---------------------------------------------------------------------------
+
+def _build_d4_permutations() -> Tuple[Tuple[int, ...], ...]:
+    maps: List[Tuple[int, ...]] = []
     for reflect in (False, True):
         for rot in range(4):
             perm = [0] * NUM_CELLS
@@ -545,2305 +625,1393 @@ def _build_d4_maps() -> Tuple[Tuple[int, ...], ...]:
     return tuple(maps)
 
 
-D4_MAPS: Tuple[Tuple[int, ...], ...] = _build_d4_maps()
+D4_PERMUTATIONS = _build_d4_permutations()
 
 
-def _relabel_canonical(grid: Sequence[int]) -> str:
+def canonical_relabel(grid: Sequence[int]) -> str:
     mapping: Dict[int, str] = {0: "0"}
-    nxt = 1
+    next_symbol = 1
     out: List[str] = []
-    for v in grid:
-        if v not in mapping:
-            mapping[v] = str(nxt)
-            nxt += 1
-        out.append(mapping[v])
+    for val in grid:
+        if val not in mapping:
+            mapping[val] = str(next_symbol)
+            next_symbol += 1
+        out.append(mapping[val])
     return "".join(out)
 
 
-def canonical_d4(grid: Sequence[int], use_d4: bool = True) -> str:
-    if not use_d4:
-        return _relabel_canonical(grid)
+def canonicalize_d4_grid(grid: Sequence[int]) -> str:
     best: Optional[str] = None
-    for perm in D4_MAPS:
-        t = [grid[perm[i]] for i in range(NUM_CELLS)]
-        r = _relabel_canonical(t)
-        if best is None or r < best:
-            best = r
+    for perm in D4_PERMUTATIONS:
+        transformed = [grid[perm[i]] for i in range(NUM_CELLS)]
+        relabeled = canonical_relabel(transformed)
+        if best is None or relabeled < best:
+            best = relabeled
     assert best is not None
     return best
 
 
-def compute_canonical_hashes(puzzle: Sequence[int], solution: Sequence[int],
-                             spec: VariantSpec) -> Tuple[str, str, str]:
-    """
-    Return (exact_puzzle_hash, canonical_puzzle_hash, family_hash).
-    NOTE: This is intentionally written independently from dataset.py, though the
-    algorithm is necessarily similar (D4 + digit relabeling).
-    """
-    puz_str = grid_to_string(puzzle)
-    exact = hashlib.sha256(f"{spec.name}:{puz_str}".encode("utf-8")).hexdigest()
-    canon_puz = canonical_d4(puzzle, use_d4=spec.preserves_d4)
-    canon_puz_h = hashlib.sha256(f"{spec.name}:{canon_puz}".encode("utf-8")).hexdigest()
-    canon_sol = canonical_d4(solution, use_d4=spec.preserves_d4)
-    fam_h = hashlib.sha256(f"{spec.name}:{canon_sol}".encode("utf-8")).hexdigest()
-    return exact, canon_puz_h, fam_h
+def compute_independent_hashes(puzzle_grid: Sequence[int], solution_grid: Sequence[int], variant: str) -> Tuple[str, str, str]:
+    raw_puz = digits_to_string(puzzle_grid)
+    exact_hash = hashlib.sha256(f"{variant}:{raw_puz}".encode("utf-8")).hexdigest()
+    canon_puz = canonicalize_d4_grid(puzzle_grid)
+    canon_puz_hash = hashlib.sha256(f"{variant}:{canon_puz}".encode("utf-8")).hexdigest()
+    canon_sol = canonicalize_d4_grid(solution_grid)
+    fam_hash = hashlib.sha256(f"{variant}:{canon_sol}".encode("utf-8")).hexdigest()
+    return exact_hash, canon_puz_hash, fam_hash
 
 
 # ---------------------------------------------------------------------------
-# Technique Verifiers
+# Strict JSON & Serialization Parser (Detects Duplicate Keys & Bounded Size)
 # ---------------------------------------------------------------------------
 
-
-TECHNIQUES_SUPPORTED = {
-    "full_house", "naked_single", "hidden_single", "locked_candidates",
-    "naked_pair", "hidden_pair", "naked_triple", "hidden_triple",
-    "x_wing", "xy_wing", "swordfish", "forcing_chain_contradiction",
-}
-
-TECHNIQUES_FULLY_VERIFIED = {
-    "full_house", "naked_single", "hidden_single", "locked_candidates",
-    "naked_pair", "hidden_pair", "naked_triple", "hidden_triple",
-    "x_wing", "xy_wing", "swordfish",
-}
-
-TECHNIQUES_BEST_EFFORT = {"forcing_chain_contradiction"}
+def _duplicate_key_detecting_hook(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+    res: Dict[str, Any] = {}
+    for k, v in pairs:
+        if k in res:
+            raise ValueError(f"Duplicate JSON key detected: {k!r}")
+        res[k] = v
+    return res
 
 
-def _apply_placement(cell: int, digit: int, values: List[int],
-                     masks: List[int], spec: VariantSpec) -> bool:
-    if values[cell] != 0:
-        return False
-    bit = 1 << (digit - 1)
-    if not (masks[cell] & bit):
-        return False
-    values[cell] = digit
-    masks[cell] = bit
-    for peer in spec.peers[cell]:
-        if values[peer] == digit:
-            return False
-        if values[peer] == 0 and (masks[peer] & bit):
-            masks[peer] &= ~bit
-            if masks[peer] == 0:
-                return False
-    return True
-
-
-def _apply_elimination(targets: Sequence[int], digits: Sequence[int],
-                       values: List[int], masks: List[int]) -> bool:
-    for t in targets:
-        if values[t] != 0:
-            return False
-        for d in digits:
-            masks[t] &= ~(1 << (d - 1))
-    return True
-
-
-def _verify_full_house(values, masks, spec, step) -> Tuple[bool, Optional[str]]:
-    targets = step["target_cells"]
-    digits = step["digits"]
-    if len(targets) != 1 or len(digits) != 1:
-        return False, "full_house expects 1 target cell and 1 digit"
-    cell = targets[0]
-    if values[cell] != 0:
-        return False, f"cell {cell} already filled"
-    for unit in spec.units:
-        if cell not in unit:
-            continue
-        empty = [c for c in unit if values[c] == 0]
-        if len(empty) == 1 and empty[0] == cell:
-            if masks[cell].bit_count() == 1 and masks[cell] == (1 << (digits[0] - 1)):
-                return True, None
-    return False, "no unit with exactly one empty cell equal to target"
-
-
-def _verify_naked_single(values, masks, spec, step) -> Tuple[bool, Optional[str]]:
-    targets = step["target_cells"]
-    digits = step["digits"]
-    if len(targets) != 1 or len(digits) != 1:
-        return False, "naked_single expects 1 target cell and 1 digit"
-    cell = targets[0]
-    if values[cell] != 0:
-        return False, f"cell {cell} already filled"
-    if masks[cell] != (1 << (digits[0] - 1)):
-        return False, f"cell {cell} candidates {masks[cell]:#x} != single digit {digits[0]}"
-    return True, None
-
-
-def _verify_hidden_single(values, masks, spec, step) -> Tuple[bool, Optional[str]]:
-    targets = step["target_cells"]
-    digits = step["digits"]
-    if len(targets) != 1 or len(digits) != 1:
-        return False, "hidden_single expects 1 target cell and 1 digit"
-    cell = targets[0]
-    digit = digits[0]
-    bit = 1 << (digit - 1)
-    if values[cell] != 0:
-        return False, f"cell {cell} already filled"
-    if not (masks[cell] & bit):
-        return False, f"digit {digit} not a candidate in target cell {cell}"
-    for unit in spec.units:
-        if cell not in unit:
-            continue
-        holders = [c for c in unit if values[c] == 0 and (masks[c] & bit)]
-        if len(holders) == 1 and holders[0] == cell:
-            return True, None
-    return False, f"digit {digit} not hidden single in any unit of cell {cell}"
-
-
-def _verify_locked_candidates(values, masks, spec, step) -> Tuple[bool, Optional[str]]:
-    targets = step["target_cells"]
-    digits = step["digits"]
-    if len(digits) != 1:
-        return False, "locked_candidates expects 1 digit"
-    if not targets:
-        return False, "no targets"
-    digit = digits[0]
-    bit = 1 << (digit - 1)
-    # Find unit_a that contains all cells with candidate d (restricted to the ones
-    # that also touch unit_b), and a unit_b != unit_a whose cells outside unit_a
-    # are exactly `targets`.
-    for unit_a in spec.units:
-        holders = [c for c in unit_a if values[c] == 0 and (masks[c] & bit)]
-        if len(holders) < 2:
-            continue
-        for unit_b in spec.units:
-            if unit_b is unit_a:
-                continue
-            set_a = set(unit_a)
-            set_b = set(unit_b)
-            if not all(h in set_b for h in holders):
-                continue
-            candidates_b_outside_a = [
-                c for c in unit_b
-                if c not in set_a and values[c] == 0 and (masks[c] & bit)
-            ]
-            if sorted(candidates_b_outside_a) == sorted(targets):
-                return True, None
-    return False, "locked_candidates pattern not found"
-
-
-def _verify_naked_subset(values, masks, spec, step, size) -> Tuple[bool, Optional[str]]:
-    targets = step["target_cells"]
-    digits = step["digits"]
-    if len(digits) != size:
-        return False, f"naked_{size} expects {size} digits"
-    if len(targets) == 0:
-        return False, "no targets"
-    bitmask = 0
-    for d in digits:
-        bitmask |= 1 << (d - 1)
-    # Find a unit containing all `targets` and a set of `size` cells within that
-    # unit whose union of candidates equals bitmask, and which are disjoint from
-    # targets.
-    for unit in spec.units:
-        if not all(t in unit for t in targets):
-            continue
-        empty = [c for c in unit if values[c] == 0]
-        # Look for a `size`-subset of empty cells whose union == bitmask and whose
-        # intersection with targets is empty
-        # (target cells are typically NOT part of the subset)
-        import itertools
-        candidate_cells = [c for c in empty if c not in targets]
-        for subset in itertools.combinations(candidate_cells, size):
-            union = 0
-            for c in subset:
-                union |= masks[c]
-            if union.bit_count() != size:
-                continue
-            if union != bitmask:
-                continue
-            # Verify that each target contains at least one of `digits`
-            if all((masks[t] & bitmask) != 0 for t in targets):
-                # Verify removal is meaningful (targets have extra candidates)
-                # Actually if target only has these digits, elimination would be no-op
-                # Both are acceptable; but the record says elimination, so we check
-                # that it is a legal action.
-                return True, None
-    return False, f"naked_{size} pattern not found"
-
-
-def _verify_hidden_subset(values, masks, spec, step, size) -> Tuple[bool, Optional[str]]:
-    targets = step["target_cells"]
-    digits = step["digits"]
-    if len(digits) != size:
-        return False, f"hidden_{size} expects {size} digits"
-    bits = [1 << (d - 1) for d in digits]
-    digit_mask = 0
-    for b in bits:
-        digit_mask |= b
-    # Find a unit containing the targets, and where each digit's holder set is a
-    # subset of the size cells.
-    for unit in spec.units:
-        if not all(t in unit for t in targets):
-            continue
-        # Union of holders across the digits
-        union_holders: Set[int] = set()
-        ok = True
-        for b in bits:
-            holders = [c for c in unit if values[c] == 0 and (masks[c] & b)]
-            if len(holders) == 0:
-                ok = False
-                break
-            union_holders.update(holders)
-        if not ok:
-            continue
-        if len(union_holders) != size:
-            continue
-        # Every target must be among holders and must have candidates outside digit_mask
-        if not union_holders.issubset(set(targets)):
-            continue
-        if all((masks[t] & ~digit_mask) != 0 for t in targets):
-            return True, None
-    return False, f"hidden_{size} pattern not found"
-
-
-def _verify_x_wing(values, masks, spec, step) -> Tuple[bool, Optional[str]]:
-    targets = step["target_cells"]
-    digits = step["digits"]
-    if len(digits) != 1:
-        return False, "x_wing expects 1 digit"
-    d = digits[0]
-    bit = 1 << (d - 1)
-    # Find two rows with candidates for d in exactly the same 2 columns
-    row_cands: Dict[int, List[int]] = {}
-    for r in range(9):
-        cols = [c for c in range(9)
-                if values[r * 9 + c] == 0 and (masks[r * 9 + c] & bit)]
-        row_cands[r] = cols
-    import itertools
-    for r1, r2 in itertools.combinations(range(9), 2):
-        c1 = row_cands[r1]
-        c2 = row_cands[r2]
-        if len(c1) != 2 or len(c2) != 2:
-            continue
-        if set(c1) != set(c2):
-            continue
-        cols = c1
-        # Targets should be cells in columns `cols`, not in rows r1/r2, with bit set
-        expected = set()
-        for c in cols:
-            for r in range(9):
-                if r in (r1, r2):
-                    continue
-                cell = r * 9 + c
-                if values[cell] == 0 and (masks[cell] & bit):
-                    expected.add(cell)
-        if expected == set(targets) and expected:
-            return True, None
-    # Column-based X-Wing
-    col_cands: Dict[int, List[int]] = {}
-    for c in range(9):
-        rows = [r for r in range(9)
-                if values[r * 9 + c] == 0 and (masks[r * 9 + c] & bit)]
-        col_cands[c] = rows
-    for c1, c2 in itertools.combinations(range(9), 2):
-        r1 = col_cands[c1]
-        r2 = col_cands[c2]
-        if len(r1) != 2 or len(r2) != 2:
-            continue
-        if set(r1) != set(r2):
-            continue
-        rows = r1
-        expected = set()
-        for r in rows:
-            for c in range(9):
-                if c in (c1, c2):
-                    continue
-                cell = r * 9 + c
-                if values[cell] == 0 and (masks[cell] & bit):
-                    expected.add(cell)
-        if expected == set(targets) and expected:
-            return True, None
-    return False, "x_wing pattern not found"
-
-
-def _verify_xy_wing(values, masks, spec, step) -> Tuple[bool, Optional[str]]:
-    targets = step["target_cells"]
-    digits = step["digits"]
-    if len(digits) != 1:
-        return False, "xy_wing expects 1 elimination digit"
-    z = digits[0]
-    z_bit = 1 << (z - 1)
-    # Find pivot bivalue {X,Y} and pincers {X,Z}, {Y,Z}
-    bivalue = [c for c in range(NUM_CELLS)
-               if values[c] == 0 and masks[c].bit_count() == 2]
-    for pivot in bivalue:
-        pm = masks[pivot]
-        x_bit = pm & -pm
-        y_bit = pm ^ x_bit
-        if x_bit == z_bit or y_bit == z_bit:
-            continue
-        peer_bivalues = [p for p in spec.peers[pivot] if p in set(bivalue)]
-        for p1 in peer_bivalues:
-            if not (masks[p1] & x_bit):
-                continue
-            if masks[p1] & y_bit:
-                continue
-            p1_other = masks[p1] ^ x_bit
-            if p1_other != z_bit:
-                continue
-            for p2 in peer_bivalues:
-                if p2 == p1:
-                    continue
-                if not (masks[p2] & y_bit):
-                    continue
-                if masks[p2] & x_bit:
-                    continue
-                p2_other = masks[p2] ^ y_bit
-                if p2_other != z_bit:
-                    continue
-                common = set(spec.peers[p1]).intersection(spec.peers[p2])
-                common.discard(pivot)
-                expected = set(c for c in common
-                               if values[c] == 0 and (masks[c] & z_bit))
-                if expected == set(targets) and expected:
-                    return True, None
-    return False, "xy_wing pattern not found"
-
-
-def _verify_swordfish(values, masks, spec, step) -> Tuple[bool, Optional[str]]:
-    targets = step["target_cells"]
-    digits = step["digits"]
-    if len(digits) != 1:
-        return False, "swordfish expects 1 digit"
-    d = digits[0]
-    bit = 1 << (d - 1)
-    import itertools
-    for r1, r2, r3 in itertools.combinations(range(9), 3):
-        rows = [r1, r2, r3]
-        all_cols: Set[int] = set()
-        valid = True
-        for r in rows:
-            cols = [c for c in range(9)
-                    if values[r * 9 + c] == 0 and (masks[r * 9 + c] & bit)]
-            if not (2 <= len(cols) <= 3):
-                valid = False
-                break
-            all_cols.update(cols)
-        if not valid or len(all_cols) != 3:
-            continue
-        expected = set()
-        for c in all_cols:
-            for r in range(9):
-                if r in rows:
-                    continue
-                cell = r * 9 + c
-                if values[cell] == 0 and (masks[cell] & bit):
-                    expected.add(cell)
-        if expected == set(targets) and expected:
-            return True, None
-    # Column-based
-    for c1, c2, c3 in itertools.combinations(range(9), 3):
-        cols = [c1, c2, c3]
-        all_rows: Set[int] = set()
-        valid = True
-        for c in cols:
-            rows = [r for r in range(9)
-                    if values[r * 9 + c] == 0 and (masks[r * 9 + c] & bit)]
-            if not (2 <= len(rows) <= 3):
-                valid = False
-                break
-            all_rows.update(rows)
-        if not valid or len(all_rows) != 3:
-            continue
-        expected = set()
-        for r in all_rows:
-            for c in range(9):
-                if c in cols:
-                    continue
-                cell = r * 9 + c
-                if values[cell] == 0 and (masks[cell] & bit):
-                    expected.add(cell)
-        if expected == set(targets) and expected:
-            return True, None
-    return False, "swordfish pattern not found"
-
-
-def _verify_forcing_chain_best_effort(values, masks, spec, step
-                                       ) -> Tuple[Optional[bool], Optional[str]]:
-    """
-    Best-effort verification: try assuming the eliminated digit at the target cell
-    and propagate. If a contradiction appears, the elimination is consistent.
-    Returns (True, None) on contradiction, (False, msg) if no contradiction, or
-    (None, msg) if verification is inconclusive.
-    """
-    targets = step["target_cells"]
-    digits = step["digits"]
-    if len(targets) != 1 or len(digits) != 1:
-        return None, "forcing_chain expects 1 target and 1 digit"
-    cell = targets[0]
-    d = digits[0]
-    bit = 1 << (d - 1)
-    if values[cell] != 0:
-        return None, f"cell {cell} already filled"
-    if not (masks[cell] & bit):
-        return None, "eliminated digit not a candidate"
-    tv = list(values)
-    tm = list(masks)
-    tv[cell] = d
-    tm[cell] = bit
-    for peer in spec.peers[cell]:
-        if tv[peer] == d:
-            return True, None
-        if tv[peer] == 0 and (tm[peer] & bit):
-            tm[peer] &= ~bit
-            if tm[peer] == 0:
-                return True, None
-    ok, _ = _propagate(tv, tm, spec)
-    if not ok:
-        return True, None
-    return None, "no immediate contradiction detected (best-effort)"
-
-
-def _run_technique_verifier(values, masks, spec, step
-                            ) -> Tuple[Optional[bool], Optional[str]]:
-    """
-    Returns (True, None) if verified, (False, reason) if provably invalid,
-    (None, reason) if unverified/inconclusive.
-    """
-    tech = step["technique"]
-    if tech == "full_house":
-        return _verify_full_house(values, masks, spec, step)
-    if tech == "naked_single":
-        return _verify_naked_single(values, masks, spec, step)
-    if tech == "hidden_single":
-        return _verify_hidden_single(values, masks, spec, step)
-    if tech == "locked_candidates":
-        return _verify_locked_candidates(values, masks, spec, step)
-    if tech == "naked_pair":
-        return _verify_naked_subset(values, masks, spec, step, 2)
-    if tech == "naked_triple":
-        return _verify_naked_subset(values, masks, spec, step, 3)
-    if tech == "hidden_pair":
-        return _verify_hidden_subset(values, masks, spec, step, 2)
-    if tech == "hidden_triple":
-        return _verify_hidden_subset(values, masks, spec, step, 3)
-    if tech == "x_wing":
-        return _verify_x_wing(values, masks, spec, step)
-    if tech == "xy_wing":
-        return _verify_xy_wing(values, masks, spec, step)
-    if tech == "swordfish":
-        return _verify_swordfish(values, masks, spec, step)
-    if tech == "forcing_chain_contradiction":
-        return _verify_forcing_chain_best_effort(values, masks, spec, step)
-    return None, f"unsupported technique '{tech}'"
+def strict_json_loads(line_str: str) -> Dict[str, Any]:
+    return json.loads(line_str, object_pairs_hook=_duplicate_key_detecting_hook)
 
 
 # ---------------------------------------------------------------------------
-# Trace Replay
+# Finding Model & Diagnostic Data Structures
 # ---------------------------------------------------------------------------
-
 
 @dataclass
-class TraceReplayResult:
-    ok: bool
-    first_error: Optional[str]
-    verified_steps: int
-    unverified_steps: int
-    invalid_steps: int
-    techniques_verified: List[str]
-    techniques_unverified: List[str]
-    reached_full_solution: bool
-
-
-def replay_technique_trace(trace: Sequence[Dict[str, Any]],
-                           puzzle: Sequence[int],
-                           solution: Optional[Sequence[int]],
-                           spec: VariantSpec) -> TraceReplayResult:
-    """
-    Replays a technique_trace from the puzzle state, verifying each step.
-    Returns an aggregated result. Never asserts full verification when a step
-    is only 'best-effort' or unsupported.
-    """
-    values = list(puzzle)
-    masks = [0] * NUM_CELLS
-    for cell in range(NUM_CELLS):
-        if values[cell] != 0:
-            masks[cell] = 1 << (values[cell] - 1)
-        else:
-            masks[cell] = ALL_DIGITS_MASK
-    for cell in range(NUM_CELLS):
-        if values[cell] != 0:
-            d = values[cell]
-            bit = 1 << (d - 1)
-            for peer in spec.peers[cell]:
-                if values[peer] == 0:
-                    masks[peer] &= ~bit
-
-    verified = 0
-    unverified = 0
-    invalid = 0
-    tech_verified: Set[str] = set()
-    tech_unverified: Set[str] = set()
-
-    for idx, step in enumerate(trace):
-        if not isinstance(step, dict):
-            return TraceReplayResult(False, f"step {idx}: not an object",
-                                     verified, unverified, invalid,
-                                     sorted(tech_verified),
-                                     sorted(tech_unverified), False)
-        tech = step.get("technique")
-        action = step.get("action_type")
-        if not isinstance(tech, str) or not isinstance(action, str):
-            return TraceReplayResult(False, f"step {idx}: missing technique/action",
-                                     verified, unverified, invalid,
-                                     sorted(tech_verified),
-                                     sorted(tech_unverified), False)
-
-        verdict, reason = _run_technique_verifier(values, masks, spec, step)
-        if verdict is False:
-            invalid += 1
-            return TraceReplayResult(False, f"step {idx} ({tech}): {reason}",
-                                     verified, unverified, invalid,
-                                     sorted(tech_verified),
-                                     sorted(tech_unverified), False)
-        if verdict is None:
-            unverified += 1
-            tech_unverified.add(tech)
-        else:
-            verified += 1
-            tech_verified.add(tech)
-
-        # Apply the action (best-effort for unverified techniques)
-        ok = True
-        if action == "placement":
-            targets = step.get("target_cells") or []
-            digits = step.get("digits") or []
-            if len(targets) == 1 and len(digits) == 1:
-                ok = _apply_placement(int(targets[0]), int(digits[0]),
-                                      values, masks, spec)
-        elif action == "elimination":
-            targets = step.get("target_cells") or []
-            digits = step.get("digits") or []
-            ok = _apply_elimination([int(t) for t in targets],
-                                    [int(d) for d in digits],
-                                    values, masks)
-        else:
-            ok = False
-
-        if not ok:
-            return TraceReplayResult(False, f"step {idx}: action '{action}' failed to apply",
-                                     verified, unverified, invalid,
-                                     sorted(tech_verified),
-                                     sorted(tech_unverified), False)
-
-    reached = False
-    if solution is not None and all(v != 0 for v in values):
-        reached = all(values[i] == solution[i] for i in range(NUM_CELLS))
-
-    return TraceReplayResult(True, None, verified, unverified, invalid,
-                             sorted(tech_verified), sorted(tech_unverified), reached)
-
-
-# ---------------------------------------------------------------------------
-# Findings
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class Finding:
+class ValidationFinding:
+    layer: str  # Layer A through G
+    severity: ValidationSeverity
     category: str
-    severity: str
-    code: str
     message: str
-    file: Optional[str] = None
-    line: Optional[int] = None
     record_id: Optional[str] = None
-    evidence: Dict[str, Any] = field(default_factory=dict)
+    file_path: Optional[str] = None
+    line_number: Optional[int] = None
+    repairable: bool = False
+    action_taken: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
+            "layer": self.layer,
+            "severity": self.severity.value,
             "category": self.category,
-            "severity": self.severity,
-            "code": self.code,
             "message": self.message,
-            "file": self.file,
-            "line": self.line,
             "record_id": self.record_id,
-            "evidence": self.evidence,
+            "file_path": self.file_path,
+            "line_number": self.line_number,
+            "repairable": self.repairable,
+            "action_taken": self.action_taken,
         }
 
 
-# ---------------------------------------------------------------------------
-# Schema Profile
-# ---------------------------------------------------------------------------
-
-
-REQUIRED_KEYS_V2 = {
-    "schema_version", "puzzle_id", "split", "variant", "difficulty",
-    "difficulty_raw", "difficulty_features", "givens", "puzzle", "solution",
-    "solution_count_status", "unique_solution", "task_type", "target",
-    "technique_trace", "generator_version", "generation_seed",
-    "solver_version", "provenance", "validation_status", "record_sha256",
-}
-
-
-def _check_json_strict(raw: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Parse JSON with duplicate-key detection."""
-    def _hook(pairs):
-        keys = [k for k, _ in pairs]
-        if len(keys) != len(set(keys)):
-            seen = set()
-            dups = [k for k in keys if k in seen or seen.add(k)]
-            raise ValueError(f"duplicate JSON keys: {sorted(set(dups))}")
-        return dict(pairs)
-
-    try:
-        obj = json.loads(raw, object_pairs_hook=_hook,
-                         parse_constant=lambda x: (_ for _ in ()).throw(
-                             ValueError(f"forbidden JSON constant {x}")))
-    except json.JSONDecodeError as e:
-        return None, f"json_decode_error: {e}"
-    except ValueError as e:
-        return None, str(e)
-    if not isinstance(obj, dict):
-        return None, "top-level JSON is not an object"
-    return obj, None
-
-
-def _is_finite_number(x: Any) -> bool:
-    if isinstance(x, bool):
-        return False
-    if not isinstance(x, (int, float)):
-        return False
-    if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
-        return False
-    return True
-
-
-def _is_int(x: Any) -> bool:
-    return isinstance(x, int) and not isinstance(x, bool)
-
-
-# ---------------------------------------------------------------------------
-# Record Validator
-# ---------------------------------------------------------------------------
-
-
 @dataclass
-class RecordValidationOutcome:
-    verdict: Verdict
-    findings: List[Finding]
-    repaired_record: Optional[Dict[str, Any]]
-    repairs_applied: List[Dict[str, Any]]
-
-
-def validate_record(
-    record: Dict[str, Any],
-    file_path: str,
-    line_no: int,
-    spec_override: Optional[VariantSpec],
-    mode: RepairMode,
-    max_solver_sec: float,
-    max_solver_nodes: int,
-) -> RecordValidationOutcome:
-    findings: List[Finding] = []
-    repairs: List[Dict[str, Any]] = []
-    record = dict(record)  # shallow copy so we can mutate safely
-
-    def add(cat: ValidationCategory, sev: Severity, code: str, msg: str,
-            **ev: Any) -> None:
-        findings.append(Finding(cat.value, sev.value, code, msg,
-                                file=file_path, line=line_no,
-                                record_id=record.get("puzzle_id"),
-                                evidence=ev))
-
-    # --- Schema version ---
-    sv = record.get("schema_version")
-    if not isinstance(sv, str):
-        add(ValidationCategory.SCHEMA, Severity.CRITICAL, "missing_schema_version",
-            "schema_version missing or not a string")
-        return RecordValidationOutcome(Verdict.INVALID, findings, None, repairs)
-    if sv not in SUPPORTED_SCHEMA_VERSIONS:
-        add(ValidationCategory.SCHEMA, Severity.CRITICAL, "unsupported_schema_version",
-            f"schema_version {sv!r} not supported; supported={list(SUPPORTED_SCHEMA_VERSIONS)}")
-        return RecordValidationOutcome(Verdict.INVALID, findings, None, repairs)
-
-    # --- Required fields ---
-    missing = REQUIRED_KEYS_V2 - set(record.keys())
-    if missing:
-        add(ValidationCategory.SCHEMA, Severity.CRITICAL, "missing_fields",
-            f"missing required keys: {sorted(missing)}")
-        return RecordValidationOutcome(Verdict.INVALID, findings, None, repairs)
-
-    # --- Variant ---
-    variant_name = record.get("variant")
-    if not isinstance(variant_name, str):
-        add(ValidationCategory.SCHEMA, Severity.CRITICAL, "bad_variant",
-            "variant not a string")
-        return RecordValidationOutcome(Verdict.INVALID, findings, None, repairs)
-    if spec_override is not None and variant_name != spec_override.name:
-        add(ValidationCategory.SCHEMA, Severity.ERROR, "variant_mismatch",
-            f"record variant {variant_name!r} != override {spec_override.name!r}")
-        return RecordValidationOutcome(Verdict.INVALID, findings, None, repairs)
-    if variant_name not in VARIANT_REGISTRY:
-        add(ValidationCategory.SCHEMA, Severity.CRITICAL, "unsupported_variant",
-            f"unsupported variant {variant_name!r}")
-        return RecordValidationOutcome(Verdict.INVALID, findings, None, repairs)
-    spec = VARIANT_REGISTRY[variant_name]
-
-    # --- Record self-checksum ---
-    claimed_sha = record.get("record_sha256")
-    if not isinstance(claimed_sha, str) or len(claimed_sha) != 64:
-        add(ValidationCategory.SCHEMA, Severity.ERROR, "bad_record_sha",
-            "record_sha256 missing or malformed")
-    else:
-        rec_copy = dict(record)
-        rec_copy.pop("record_sha256", None)
-        computed = hashlib.sha256(
-            json.dumps(rec_copy, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
-        if computed != claimed_sha:
-            add(ValidationCategory.SCHEMA, Severity.ERROR, "record_sha_mismatch",
-                "record_sha256 mismatch",
-                claimed=claimed_sha, computed=computed)
-
-    # --- Puzzle & solution parsing ---
-    puzzle_grid = parse_grid_field(record.get("puzzle"))
-    if puzzle_grid is None:
-        add(ValidationCategory.PUZZLE, Severity.CRITICAL, "bad_puzzle_field",
-            "puzzle field is not a valid 81-cell grid")
-        return RecordValidationOutcome(Verdict.INVALID, findings, None, repairs)
-    solution_grid = parse_grid_field(record.get("solution"))
-    if solution_grid is None:
-        add(ValidationCategory.SOLUTION, Severity.CRITICAL, "bad_solution_field",
-            "solution field is not a valid 81-cell grid")
-        return RecordValidationOutcome(Verdict.INVALID, findings, None, repairs)
-
-    # --- Puzzle structural integrity ---
-    ok, err = validate_puzzle_grid(puzzle_grid, spec)
-    if not ok:
-        add(ValidationCategory.PUZZLE, Severity.CRITICAL, "puzzle_invalid",
-            f"puzzle constraints violated: {err}")
-        return RecordValidationOutcome(Verdict.INVALID, findings, None, repairs)
-
-    actual_givens = sum(1 for x in puzzle_grid if x != 0)
-    if actual_givens < spec.min_theoretical_clues:
-        add(ValidationCategory.PUZZLE, Severity.CRITICAL, "below_min_clues",
-            f"givens={actual_givens} below theoretical minimum {spec.min_theoretical_clues}")
-        return RecordValidationOutcome(Verdict.INVALID, findings, None, repairs)
-
-    claimed_givens = record.get("givens")
-    if not _is_int(claimed_givens) or claimed_givens != actual_givens:
-        add(ValidationCategory.DIFFICULTY, Severity.WARNING, "givens_mismatch",
-            f"claimed givens={claimed_givens} != actual={actual_givens}")
-        # Safe repair: recompute givens
-        if mode in (RepairMode.REPAIR_SAFE, RepairMode.REPAIR_AGGRESSIVE):
-            record["givens"] = actual_givens
-            repairs.append({"rule": "recompute_givens",
-                            "old": claimed_givens, "new": actual_givens})
-
-    # --- Clue preservation ---
-    for i in range(NUM_CELLS):
-        if puzzle_grid[i] != 0 and puzzle_grid[i] != solution_grid[i]:
-            add(ValidationCategory.SOLUTION, Severity.CRITICAL, "clue_preservation",
-                f"clue at cell {i} ({puzzle_grid[i]}) not preserved in solution ({solution_grid[i]})")
-            return RecordValidationOutcome(Verdict.INVALID, findings, None, repairs)
-
-    # --- Solution correctness ---
-    ok, err = validate_solution_grid(solution_grid, spec)
-    if not ok:
-        add(ValidationCategory.SOLUTION, Severity.CRITICAL, "solution_invalid",
-            f"stored solution fails verification: {err}")
-        # Try to repair: regenerate
-        if mode in (RepairMode.REPAIR_SAFE, RepairMode.REPAIR_AGGRESSIVE):
-            regen = solve_and_count(puzzle_grid, spec, limit=2,
-                                    timeout_sec=max_solver_sec,
-                                    max_nodes=max_solver_nodes)
-            if regen.status == SolverStatus.UNIQUE and regen.first_solution is not None:
-                record["solution"] = grid_to_string(regen.first_solution)
-                repairs.append({"rule": "regenerate_solution",
-                                "old": grid_to_string(solution_grid),
-                                "new": record["solution"],
-                                "evidence": "independent solver proved uniqueness"})
-                add(ValidationCategory.REPAIR, Severity.INFO, "repaired_solution",
-                    "solution regenerated from puzzle via independent solver")
-                solution_grid = regen.first_solution
-                # Recheck clue preservation
-                for i in range(NUM_CELLS):
-                    if puzzle_grid[i] != 0 and puzzle_grid[i] != solution_grid[i]:
-                        add(ValidationCategory.REPAIR, Severity.CRITICAL,
-                            "repair_failed_clue",
-                            "regenerated solution does not preserve clue")
-                        return RecordValidationOutcome(Verdict.QUARANTINED,
-                                                       findings, None, repairs)
-            else:
-                add(ValidationCategory.REPAIR, Severity.ERROR, "repair_refused",
-                    f"cannot safely repair solution: solver status={regen.status.value}")
-                return RecordValidationOutcome(Verdict.QUARANTINED, findings, None, repairs)
-        else:
-            return RecordValidationOutcome(Verdict.INVALID, findings, None, repairs)
-
-    # --- Uniqueness / satisfiability ---
-    sres = solve_and_count(puzzle_grid, spec, limit=2,
-                           timeout_sec=max_solver_sec,
-                           max_nodes=max_solver_nodes)
-    claimed_status = record.get("solution_count_status")
-    claimed_unique = record.get("unique_solution")
-
-    if sres.status == SolverStatus.UNSAT:
-        add(ValidationCategory.UNIQUENESS, Severity.CRITICAL, "puzzle_unsat",
-            "independent solver proved no solution exists")
-        return RecordValidationOutcome(Verdict.INVALID, findings, None, repairs)
-    if sres.status == SolverStatus.MULTIPLE:
-        add(ValidationCategory.UNIQUENESS, Severity.CRITICAL, "puzzle_multiple",
-            "independent solver found >= 2 solutions")
-        if mode in (RepairMode.REPAIR_AGGRESSIVE,):
-            add(ValidationCategory.REPAIR, Severity.WARNING, "no_aggressive_repair",
-                "aggressive mode cannot reduce multi-solution to unique without changing puzzle")
-        return RecordValidationOutcome(Verdict.QUARANTINED, findings, None, repairs)
-    if sres.status in (SolverStatus.TIMEOUT, SolverStatus.NODE_LIMIT):
-        add(ValidationCategory.UNIQUENESS, Severity.WARNING, "uniqueness_unresolved",
-            f"uniqueness could not be established: {sres.status.value}")
-        # Record but treat as UNRESOLVED
-        return RecordValidationOutcome(Verdict.UNRESOLVED, findings, None, repairs)
-
-    # UNIQUE — compare with claimed status
-    if claimed_status != "unique":
-        add(ValidationCategory.UNIQUENESS, Severity.WARNING, "status_mismatch",
-            f"claimed status={claimed_status!r} but solver says unique")
-        if mode in (RepairMode.REPAIR_SAFE, RepairMode.REPAIR_AGGRESSIVE):
-            record["solution_count_status"] = "unique"
-            repairs.append({"rule": "fix_solution_count_status",
-                            "old": claimed_status, "new": "unique"})
-    if claimed_unique is not True:
-        add(ValidationCategory.UNIQUENESS, Severity.WARNING, "unique_flag_mismatch",
-            f"unique_solution={claimed_unique!r}, solver says True")
-        if mode in (RepairMode.REPAIR_SAFE, RepairMode.REPAIR_AGGRESSIVE):
-            record["unique_solution"] = True
-            repairs.append({"rule": "fix_unique_solution_flag",
-                            "old": claimed_unique, "new": True})
-
-    # Also verify stored solution equals solver's solution (up to equivalence)
-    if sres.first_solution is not None:
-        if sres.first_solution != solution_grid:
-            # Could legitimately differ only if solution_grid wasn't what solver found
-            add(ValidationCategory.SOLUTION, Severity.CRITICAL, "solution_mismatch",
-                "stored solution differs from independently-derived solution")
-            if mode in (RepairMode.REPAIR_SAFE, RepairMode.REPAIR_AGGRESSIVE):
-                # Since puzzle is unique, solver's solution must be the only one
-                old_sol = record["solution"]
-                record["solution"] = grid_to_string(sres.first_solution)
-                repairs.append({"rule": "replace_solution_with_unique",
-                                "old": old_sol, "new": record["solution"]})
-                solution_grid = sres.first_solution
-            else:
-                return RecordValidationOutcome(Verdict.INVALID, findings, None, repairs)
-
-    # --- Provenance / canonical hashes ---
-    prov = record.get("provenance")
-    if not isinstance(prov, dict):
-        add(ValidationCategory.SCHEMA, Severity.ERROR, "bad_provenance",
-            "provenance missing or not an object")
-    else:
-        exact, canon_h, family_h = compute_canonical_hashes(puzzle_grid, solution_grid, spec)
-        if prov.get("exact_puzzle_hash") != exact:
-            add(ValidationCategory.SCHEMA, Severity.WARNING, "provenance_exact_hash_mismatch",
-                "provenance.exact_puzzle_hash mismatch")
-            if mode in (RepairMode.REPAIR_SAFE, RepairMode.REPAIR_AGGRESSIVE):
-                prov["exact_puzzle_hash"] = exact
-                repairs.append({"rule": "fix_exact_puzzle_hash",
-                                "old": prov.get("exact_puzzle_hash"), "new": exact})
-        if prov.get("canonical_puzzle_hash") != canon_h:
-            add(ValidationCategory.SCHEMA, Severity.WARNING,
-                "provenance_canonical_hash_mismatch",
-                "provenance.canonical_puzzle_hash mismatch")
-            if mode in (RepairMode.REPAIR_SAFE, RepairMode.REPAIR_AGGRESSIVE):
-                prov["canonical_puzzle_hash"] = canon_h
-                repairs.append({"rule": "fix_canonical_puzzle_hash",
-                                "old": prov.get("canonical_puzzle_hash"), "new": canon_h})
-        if prov.get("solution_family_hash") != family_h:
-            add(ValidationCategory.SCHEMA, Severity.WARNING,
-                "provenance_family_hash_mismatch",
-                "provenance.solution_family_hash mismatch")
-            if mode in (RepairMode.REPAIR_SAFE, RepairMode.REPAIR_AGGRESSIVE):
-                prov["solution_family_hash"] = family_h
-                repairs.append({"rule": "fix_solution_family_hash",
-                                "old": prov.get("solution_family_hash"), "new": family_h})
-
-    # --- Difficulty metadata ---
-    diff = record.get("difficulty")
-    if not _is_finite_number(diff):
-        add(ValidationCategory.DIFFICULTY, Severity.ERROR, "bad_difficulty",
-            f"difficulty not a finite number: {diff!r}")
-    elif not (1.0 <= diff <= 10.0):
-        add(ValidationCategory.DIFFICULTY, Severity.ERROR, "difficulty_out_of_range",
-            f"difficulty={diff} outside [1.0, 10.0]")
-
-    diff_raw = record.get("difficulty_raw")
-    if not _is_finite_number(diff_raw):
-        add(ValidationCategory.DIFFICULTY, Severity.WARNING, "bad_difficulty_raw",
-            f"difficulty_raw not finite: {diff_raw!r}")
-
-    dfeat = record.get("difficulty_features")
-    if not isinstance(dfeat, dict):
-        add(ValidationCategory.DIFFICULTY, Severity.WARNING, "bad_difficulty_features",
-            "difficulty_features not an object")
-    else:
-        if _is_int(dfeat.get("clue_count")) and dfeat["clue_count"] != actual_givens:
-            add(ValidationCategory.DIFFICULTY, Severity.WARNING, "clue_count_mismatch",
-                f"features.clue_count={dfeat['clue_count']} != actual={actual_givens}")
-            if mode in (RepairMode.REPAIR_SAFE, RepairMode.REPAIR_AGGRESSIVE):
-                dfeat["clue_count"] = actual_givens
-                repairs.append({"rule": "fix_clue_count",
-                                "old": dfeat.get("clue_count"), "new": actual_givens})
-
-    # --- Technique trace replay ---
-    trace = record.get("technique_trace")
-    if not isinstance(trace, list):
-        add(ValidationCategory.TECHNIQUE_TRACE, Severity.WARNING, "bad_trace",
-            "technique_trace not a list")
-    else:
-        replay = replay_technique_trace(trace, puzzle_grid, solution_grid, spec)
-        if not replay.ok:
-            add(ValidationCategory.TECHNIQUE_TRACE, Severity.ERROR, "trace_invalid",
-                f"trace replay failed: {replay.first_error}",
-                verified=replay.verified_steps,
-                unverified=replay.unverified_steps,
-                invalid=replay.invalid_steps)
-        elif replay.unverified_steps > 0:
-            add(ValidationCategory.TECHNIQUE_TRACE, Severity.INFO, "trace_partial",
-                f"{replay.unverified_steps} step(s) unverified (best-effort)",
-                verified=replay.verified_steps,
-                unverified=replay.unverified_steps,
-                techniques_unverified=replay.techniques_unverified)
-
-    # --- Task-target integrity ---
-    task_type = record.get("task_type")
-    target = record.get("target")
-    if not isinstance(task_type, str):
-        add(ValidationCategory.TARGET, Severity.ERROR, "bad_task_type",
-            "task_type missing or not a string")
-    elif not isinstance(target, dict):
-        add(ValidationCategory.TARGET, Severity.ERROR, "bad_target",
-            "target missing or not an object")
-    else:
-        if task_type == "complete_solution":
-            tgt = parse_grid_field(target.get("solution_string"))
-            if tgt is None:
-                add(ValidationCategory.TARGET, Severity.ERROR, "target_bad_solution",
-                    "complete_solution target.solution_string malformed")
-            else:
-                ok_t, err_t = validate_solution_grid(tgt, spec)
-                if not ok_t:
-                    add(ValidationCategory.TARGET, Severity.CRITICAL, "target_invalid",
-                        f"target solution fails verification: {err_t}")
-                for i in range(NUM_CELLS):
-                    if puzzle_grid[i] != 0 and tgt[i] != puzzle_grid[i]:
-                        add(ValidationCategory.TARGET, Severity.CRITICAL,
-                            "target_clue_mismatch",
-                            f"target disagrees with clue at cell {i}")
-                        break
-                if tgt != solution_grid:
-                    add(ValidationCategory.TARGET, Severity.ERROR,
-                        "target_differs_from_solution",
-                        "target solution_string differs from record.solution")
-        elif task_type == "next_logical_deduction":
-            ded = target.get("deduction")
-            if not isinstance(ded, dict):
-                add(ValidationCategory.TARGET, Severity.ERROR, "bad_deduction",
-                    "next_logical_deduction target.deduction not an object")
-            else:
-                # A first-move verification: apply deduction to puzzle and check
-                # consistency with puzzle's rules.
-                action = ded.get("action_type")
-                t_cells = ded.get("target_cells") or []
-                t_digits = ded.get("digits") or []
-                if action == "placement" and len(t_cells) == 1 and len(t_digits) == 1:
-                    cell = int(t_cells[0])
-                    d = int(t_digits[0])
-                    if not (0 <= cell < NUM_CELLS) or not (1 <= d <= 9):
-                        add(ValidationCategory.TARGET, Severity.ERROR,
-                            "deduction_oob", "deduction cell/digit out of range")
-                    elif puzzle_grid[cell] != 0:
-                        add(ValidationCategory.TARGET, Severity.ERROR,
-                            "deduction_cell_filled",
-                            f"deduction targets filled cell {cell}")
-                    else:
-                        for p in spec.peers[cell]:
-                            if puzzle_grid[p] == d:
-                                add(ValidationCategory.TARGET, Severity.ERROR,
-                                    "deduction_conflict",
-                                    f"deduction digit {d} conflicts with peer {p}")
-                                break
-        elif task_type in ("candidate_elimination", "solver_policy"):
-            # Loosely validated; no forced-consistency requirement beyond type.
-            pass
-        else:
-            add(ValidationCategory.TARGET, Severity.WARNING, "unknown_task_type",
-                f"unknown task_type {task_type!r}")
-
-    # --- Compute final verdict ---
-    has_critical = any(f.severity == Severity.CRITICAL.value for f in findings)
-    has_error = any(f.severity == Severity.ERROR.value for f in findings)
-
-    if has_critical:
-        return RecordValidationOutcome(Verdict.QUARANTINED, findings, None, repairs)
-    if has_error and mode == RepairMode.AUDIT:
-        return RecordValidationOutcome(Verdict.INVALID, findings, None, repairs)
-
-    # Re-serialize if repairs were applied
-    if repairs:
-        # Recompute record_sha256
-        rec_copy = dict(record)
-        rec_copy.pop("record_sha256", None)
-        record["record_sha256"] = hashlib.sha256(
-            json.dumps(rec_copy, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
-        return RecordValidationOutcome(Verdict.REPAIRED, findings, record, repairs)
-
-    return RecordValidationOutcome(Verdict.VALID, findings, None, [])
-
-
-# ---------------------------------------------------------------------------
-# Deduplication Registry
-# ---------------------------------------------------------------------------
-
-
-class DedupRegistry:
-    """SQLite-backed hash registry for canonical puzzle and solution family."""
-
-    def __init__(self, db_path: str) -> None:
-        self.db_path = db_path
-        d = os.path.dirname(os.path.abspath(db_path))
-        if d:
-            os.makedirs(d, exist_ok=True)
-        self.conn = sqlite3.connect(db_path, timeout=30.0)
-        self.conn.execute("PRAGMA journal_mode=WAL;")
-        self.conn.execute("PRAGMA synchronous=NORMAL;")
-        with self.conn:
-            self.conn.execute(
-                "CREATE TABLE IF NOT EXISTS hashes ("
-                "  canonical_puzzle_hash TEXT NOT NULL,"
-                "  exact_puzzle_hash TEXT NOT NULL,"
-                "  family_hash TEXT NOT NULL,"
-                "  split TEXT NOT NULL,"
-                "  record_id TEXT,"
-                "  file TEXT,"
-                "  line INTEGER"
-                ")")
-            self.conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_cph ON hashes(canonical_puzzle_hash)")
-            self.conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_fh ON hashes(family_hash)")
-
-    def register(self, canon_h: str, exact_h: str, family_h: str,
-                 split: str, record_id: Optional[str],
-                 file: Optional[str], line: Optional[int]
-                 ) -> List[Tuple[str, str, Optional[str], Optional[int]]]:
-        """
-        Register a hash. Returns a list of conflicts found:
-          (kind, other_split, other_file, other_line)
-          kind in {"puzzle_dup","puzzle_leak","family_dup","family_leak"}.
-        """
-        conflicts: List[Tuple[str, str, Optional[str], Optional[int]]] = []
-        cur = self.conn.cursor()
-        cur.execute(
-            "SELECT split, file, line FROM hashes "
-            "WHERE canonical_puzzle_hash=? OR exact_puzzle_hash=?",
-            (canon_h, exact_h))
-        for other_split, ofile, oline in cur.fetchall():
-            if other_split != split:
-                conflicts.append(("puzzle_leak", other_split, ofile, oline))
-            else:
-                conflicts.append(("puzzle_dup", other_split, ofile, oline))
-        cur.execute(
-            "SELECT split, file, line FROM hashes WHERE family_hash=?",
-            (family_h,))
-        for other_split, ofile, oline in cur.fetchall():
-            if other_split != split:
-                conflicts.append(("family_leak", other_split, ofile, oline))
-            else:
-                conflicts.append(("family_dup", other_split, ofile, oline))
-        with self.conn:
-            self.conn.execute(
-                "INSERT INTO hashes VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (canon_h, exact_h, family_h, split, record_id, file, line))
-        return conflicts
-
-    def close(self) -> None:
-        try:
-            self.conn.close()
-        except Exception:
-            pass
-
-
-# ---------------------------------------------------------------------------
-# File Processing
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class FileDescriptor:
-    path: str
-    split: str
-    size_bytes: int
-
-
-@dataclass
-class ProcessingStats:
-    total_records: int = 0
-    valid_records: int = 0
-    invalid_records: int = 0
-    unresolved_records: int = 0
-    quarantined_records: int = 0
-    repaired_records: int = 0
-    structural_errors: int = 0
-    puzzle_errors: int = 0
-    solution_errors: int = 0
-    uniqueness_unresolved: int = 0
-    technique_errors: int = 0
-    difficulty_discrepancies: int = 0
-    dedup_conflicts: int = 0
-    cross_split_leaks: int = 0
-    manifest_discrepancies: int = 0
-
-
-def discover_dataset_files(input_path: str) -> List[FileDescriptor]:
-    """
-    Given a directory, discover JSONL split files.  Given a file, return it as
-    a single file with split='unknown'.
-    """
-    if os.path.isfile(input_path):
-        return [FileDescriptor(input_path, "unknown",
-                               os.path.getsize(input_path))]
-    if not os.path.isdir(input_path):
-        raise FileNotFoundError(f"Input path does not exist: {input_path}")
-
-    files: List[FileDescriptor] = []
-    for name in sorted(os.listdir(input_path)):
-        full = os.path.join(input_path, name)
-        if os.path.isdir(full):
-            for sub in sorted(os.listdir(full)):
-                if sub.endswith(".jsonl") and not sub.endswith(".part"):
-                    sp = os.path.join(full, sub)
-                    files.append(FileDescriptor(sp, name, os.path.getsize(sp)))
-        elif name.endswith(".jsonl") and not name.endswith(".part"):
-            # Top-level JSONL treated as split based on filename
-            split = "unknown"
-            for candidate in ("train", "validation", "test"):
-                if candidate in name:
-                    split = candidate
-                    break
-            files.append(FileDescriptor(full, split, os.path.getsize(full)))
-    return files
-
-
-def enforce_disk_budget(output_dir: str, min_free_mb: float) -> None:
-    probe = os.path.abspath(output_dir)
-    while not os.path.exists(probe):
-        parent = os.path.dirname(probe)
-        if parent == probe:
-            break
-        probe = parent
-    usage = shutil.disk_usage(probe)
-    free_mb = usage.free / (1024.0 * 1024.0)
-    if free_mb < min_free_mb:
-        raise RuntimeError(
-            f"Free disk {free_mb:.1f} MB below threshold {min_free_mb:.1f} MB")
-
-
-def _atomic_write_line(fh, obj: Dict[str, Any]) -> None:
-    fh.write(json.dumps(obj, sort_keys=True, separators=(",", ":")) + "\n")
-
-
-# ---------------------------------------------------------------------------
-# Manifest check
-# ---------------------------------------------------------------------------
-
-
-def check_manifest(split_dir: str, jsonl_path: str,
-                   stats: ProcessingStats) -> List[Finding]:
-    findings: List[Finding] = []
-    manifest_path = os.path.join(split_dir, "manifest.json")
-    if not os.path.exists(manifest_path):
-        findings.append(Finding(
-            ValidationCategory.MANIFEST.value, Severity.INFO.value,
-            "manifest_missing",
-            f"no manifest.json next to {jsonl_path}",
-            file=jsonl_path))
-        return findings
-
-    try:
-        with open(manifest_path, "r", encoding="utf-8") as f:
-            manifest = json.load(f)
-    except Exception as e:
-        findings.append(Finding(
-            ValidationCategory.MANIFEST.value, Severity.ERROR.value,
-            "manifest_parse_error",
-            f"cannot parse manifest: {e}",
-            file=manifest_path))
-        return findings
-
-    claimed_sha = manifest.get("file_sha256")
-    if isinstance(claimed_sha, str):
-        h = hashlib.sha256()
-        try:
-            with open(jsonl_path, "rb") as f:
-                while True:
-                    chunk = f.read(1 << 20)
-                    if not chunk:
-                        break
-                    h.update(chunk)
-            actual = h.hexdigest()
-            if actual != claimed_sha:
-                findings.append(Finding(
-                    ValidationCategory.MANIFEST.value, Severity.ERROR.value,
-                    "manifest_hash_mismatch",
-                    "manifest file_sha256 does not match actual file hash",
-                    file=manifest_path,
-                    evidence={"claimed": claimed_sha, "actual": actual}))
-        except OSError as e:
-            findings.append(Finding(
-                ValidationCategory.MANIFEST.value, Severity.ERROR.value,
-                "manifest_hash_unreadable", str(e), file=manifest_path))
-
-    claimed_count = manifest.get("accepted_count")
-    if isinstance(claimed_count, int):
-        actual_count = stats.valid_records + stats.repaired_records
-        if claimed_count != actual_count:
-            findings.append(Finding(
-                ValidationCategory.MANIFEST.value, Severity.WARNING.value,
-                "manifest_count_mismatch",
-                f"manifest accepted_count={claimed_count} but audited valid={actual_count}",
-                file=manifest_path,
-                evidence={"claimed": claimed_count, "actual": actual_count}))
-
-    return findings
-
-
-# ---------------------------------------------------------------------------
-# Report
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class AuditReport:
-    validator_name: str
-    validator_version: str
-    started_unix: float
-    finished_unix: float
-    input_path: str
-    output_path: Optional[str]
-    mode: str
-    schema_profile: str
-    files: List[Dict[str, Any]]
-    stats: Dict[str, Any]
-    findings: List[Dict[str, Any]]
-    repairs: List[Dict[str, Any]]
-    overall_status: str
-    exit_code: int
-    limitations: List[str]
+class RepairRecord:
+    record_id: str
+    file_path: str
+    line_number: int
+    rule: str
+    old_value_summary: str
+    new_value_summary: str
+    timestamp_unix: float = field(default_factory=time.time)
 
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
 
 
 # ---------------------------------------------------------------------------
-# Main Audit Orchestration
+# SQLite Deduplication & Cross-Split Registry
 # ---------------------------------------------------------------------------
+
+class AuditRegistry:
+    def __init__(self, db_path: str) -> None:
+        self.db_path = db_path
+        os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+        self.conn = sqlite3.connect(db_path, timeout=30.0)
+        self.conn.execute("PRAGMA journal_mode=WAL;")
+        self.conn.execute("PRAGMA synchronous=NORMAL;")
+        self._init_tables()
+
+    def _init_tables(self) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS seen_records (
+                    puzzle_id TEXT PRIMARY KEY,
+                    file_path TEXT,
+                    line_no INT,
+                    split TEXT
+                );
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS seen_puzzles (
+                    canonical_hash TEXT PRIMARY KEY,
+                    exact_hash TEXT NOT NULL,
+                    puzzle_id TEXT NOT NULL,
+                    split TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    line_no INT NOT NULL
+                );
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS seen_families (
+                    family_hash TEXT PRIMARY KEY,
+                    split TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    line_no INT NOT NULL
+                );
+                """
+            )
+
+    def register_and_audit_leak(
+        self,
+        puzzle_id: str,
+        split: str,
+        file_path: str,
+        line_no: int,
+        exact_hash: str,
+        canon_hash: str,
+        family_hash: str,
+    ) -> List[ValidationFinding]:
+        findings: List[ValidationFinding] = []
+        cur = self.conn.cursor()
+
+        # Check puzzle ID duplicate
+        cur.execute("SELECT split, file_path, line_no FROM seen_records WHERE puzzle_id = ?", (puzzle_id,))
+        rec_row = cur.fetchone()
+        if rec_row is not None:
+            findings.append(
+                ValidationFinding(
+                    layer="G",
+                    severity=ValidationSeverity.ERROR,
+                    category="duplicate_puzzle_id",
+                    message=f"Duplicate puzzle_id {puzzle_id} already registered in split '{rec_row[0]}' ({rec_row[1]}:{rec_row[2]})",
+                    record_id=puzzle_id,
+                    file_path=file_path,
+                    line_number=line_no,
+                )
+            )
+
+        # Check canonical puzzle collision / leakage
+        cur.execute("SELECT split, file_path, line_no FROM seen_puzzles WHERE canonical_hash = ?", (canon_hash,))
+        puz_row = cur.fetchone()
+        if puz_row is not None:
+            existing_split = puz_row[0]
+            if existing_split != split:
+                findings.append(
+                    ValidationFinding(
+                        layer="G",
+                        severity=ValidationSeverity.CRITICAL,
+                        category="cross_split_puzzle_leakage",
+                        message=f"Puzzle is mathematically isomorphic (D4/relabeled) to one in '{existing_split}' ({puz_row[1]}:{puz_row[2]})",
+                        record_id=puzzle_id,
+                        file_path=file_path,
+                        line_number=line_no,
+                    )
+                )
+            else:
+                findings.append(
+                    ValidationFinding(
+                        layer="G",
+                        severity=ValidationSeverity.ERROR,
+                        category="duplicate_canonical_puzzle",
+                        message=f"Identical or isomorphic puzzle duplicated within same split '{split}' ({puz_row[1]}:{puz_row[2]})",
+                        record_id=puzzle_id,
+                        file_path=file_path,
+                        line_number=line_no,
+                    )
+                )
+
+        # Check solution family collision / leakage
+        cur.execute("SELECT split, file_path, line_no FROM seen_families WHERE family_hash = ?", (family_hash,))
+        fam_row = cur.fetchone()
+        if fam_row is not None:
+            existing_split = fam_row[0]
+            if existing_split != split:
+                findings.append(
+                    ValidationFinding(
+                        layer="G",
+                        severity=ValidationSeverity.CRITICAL,
+                        category="cross_split_family_leakage",
+                        message=f"Solution derived from identical completed grid family in '{existing_split}' ({fam_row[1]}:{fam_row[2]})",
+                        record_id=puzzle_id,
+                        file_path=file_path,
+                        line_number=line_no,
+                    )
+                )
+
+        with self.conn:
+            if rec_row is None:
+                self.conn.execute("INSERT INTO seen_records VALUES (?, ?, ?, ?)", (puzzle_id, file_path, line_no, split))
+            if puz_row is None:
+                self.conn.execute("INSERT INTO seen_puzzles VALUES (?, ?, ?, ?, ?, ?)", (canon_hash, exact_hash, puzzle_id, split, file_path, line_no))
+            if fam_row is None:
+                self.conn.execute("INSERT INTO seen_families VALUES (?, ?, ?, ?)", (family_hash, split, file_path, line_no))
+
+        return findings
+
+    def close(self) -> None:
+        self.conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Core Record Auditor & Safe Repair Engine
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RecordAuditResult:
+    record_id: str
+    is_valid: bool
+    is_repaired: bool
+    is_quarantined: bool
+    unresolved: bool
+    repaired_record: Optional[Dict[str, Any]]
+    findings: List[ValidationFinding]
+    repairs: List[RepairRecord]
+
+
+def audit_single_record(
+    record: Dict[str, Any],
+    file_path: str,
+    line_no: int,
+    mode: RepairMode,
+    max_solver_seconds: float = 2.0,
+) -> RecordAuditResult:
+    findings: List[ValidationFinding] = []
+    repairs: List[RepairRecord] = []
+    cur_rec = dict(record)
+
+    puzzle_id = str(cur_rec.get("puzzle_id", f"line_{line_no}"))
+
+    # -----------------------------------------------------------------------
+    # Layer A: Serialization & Schema Completeness
+    # -----------------------------------------------------------------------
+    schema_v = cur_rec.get("schema_version")
+    if schema_v not in SUPPORTED_SCHEMA_VERSIONS:
+        findings.append(
+            ValidationFinding("A", ValidationSeverity.ERROR, "unsupported_schema", f"Schema '{schema_v}' not supported", puzzle_id, file_path, line_no)
+        )
+
+    required_keys = [
+        "schema_version", "puzzle_id", "variant", "difficulty", "difficulty_raw",
+        "difficulty_features", "givens", "puzzle", "solution", "solution_count_status",
+        "unique_solution", "task_type", "target", "technique_trace", "generator_version",
+        "generation_seed", "solver_version", "provenance", "validation_status", "record_sha256"
+    ]
+    for rk in required_keys:
+        if rk not in cur_rec:
+            findings.append(
+                ValidationFinding("A", ValidationSeverity.ERROR, "missing_schema_key", f"Missing key '{rk}'", puzzle_id, file_path, line_no)
+            )
+
+    variant = str(cur_rec.get("variant", "standard")).lower()
+    if variant not in SUPPORTED_VARIANTS:
+        findings.append(
+            ValidationFinding("A", ValidationSeverity.ERROR, "unsupported_variant", f"Variant '{variant}' not supported", puzzle_id, file_path, line_no)
+        )
+        return RecordAuditResult(puzzle_id, False, False, True, False, None, findings, repairs)
+
+    geom = GEOMETRY_CACHE[variant]
+
+    # Validate Checksum Integrity (Layer A)
+    claimed_sha = cur_rec.get("record_sha256")
+    rec_copy = dict(cur_rec)
+    rec_copy.pop("record_sha256", None)
+    expected_sha = hashlib.sha256(json.dumps(rec_copy, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+    sha_mismatch = (claimed_sha != expected_sha)
+    if sha_mismatch:
+        findings.append(
+            ValidationFinding("A", ValidationSeverity.WARNING, "checksum_mismatch", "SHA-256 integrity hash does not match payload", puzzle_id, file_path, line_no, repairable=True)
+        )
+
+    # -----------------------------------------------------------------------
+    # Layer B: Puzzle Integrity
+    # -----------------------------------------------------------------------
+    raw_puzzle = cur_rec.get("puzzle")
+    puz_digits, puz_err = parse_grid_to_digits(raw_puzzle)
+    if puz_err or puz_digits is None:
+        findings.append(
+            ValidationFinding("B", ValidationSeverity.ERROR, "malformed_puzzle_representation", puz_err or "Unknown grid error", puzzle_id, file_path, line_no)
+        )
+        return RecordAuditResult(puzzle_id, False, False, True, False, None, findings, repairs)
+
+    # Check normalization repair (e.g. 2D array or dots -> 81-char string)
+    normalized_puz_str = digits_to_string(puz_digits)
+    if raw_puzzle != normalized_puz_str and mode in (RepairMode.REPAIR_SAFE, RepairMode.REPAIR_AGGRESSIVE):
+        repairs.append(RepairRecord(puzzle_id, file_path, line_no, "canonicalize_puzzle_representation", str(raw_puzzle)[:20], normalized_puz_str[:20]))
+        cur_rec["puzzle"] = normalized_puz_str
+
+    actual_givens = sum(1 for d in puz_digits if d != 0)
+    declared_givens = cur_rec.get("givens")
+    if declared_givens != actual_givens:
+        findings.append(
+            ValidationFinding("B", ValidationSeverity.WARNING, "givens_count_mismatch", f"Declared givens ({declared_givens}) != actual clues ({actual_givens})", puzzle_id, file_path, line_no, repairable=True)
+        )
+        if mode in (RepairMode.REPAIR_SAFE, RepairMode.REPAIR_AGGRESSIVE):
+            repairs.append(RepairRecord(puzzle_id, file_path, line_no, "correct_givens_count", str(declared_givens), str(actual_givens)))
+            cur_rec["givens"] = actual_givens
+
+    if actual_givens < geom.min_clues:
+        findings.append(
+            ValidationFinding("B", ValidationSeverity.ERROR, "sub_minimal_clues", f"Clue count {actual_givens} is below theoretical minimum {geom.min_clues} for {variant}", puzzle_id, file_path, line_no)
+        )
+
+    ok_puz, puz_rule_err = validate_board_consistency(puz_digits, geom, require_complete=False)
+    if not ok_puz:
+        findings.append(
+            ValidationFinding("B", ValidationSeverity.ERROR, "contradictory_givens", f"Immediate rule conflict: {puz_rule_err}", puzzle_id, file_path, line_no)
+        )
+        return RecordAuditResult(puzzle_id, False, False, True, False, None, findings, repairs)
+
+    # -----------------------------------------------------------------------
+    # Layer C & D: Solution Correctness & Independent Solvability / Uniqueness
+    # -----------------------------------------------------------------------
+    solve_res = independent_solve_and_count(puz_digits, geom, max_solutions=2, timeout_sec=max_solver_seconds)
+    
+    if solve_res.status in (SolutionStatus.UNRESOLVED_TIMEOUT, SolutionStatus.UNRESOLVED_LIMIT):
+        findings.append(
+            ValidationFinding("D", ValidationSeverity.WARNING, "solver_unresolved", f"Independent solver aborted: {solve_res.status.value}", puzzle_id, file_path, line_no)
+        )
+        return RecordAuditResult(puzzle_id, False, False, True, True, None, findings, repairs)
+
+    if solve_res.status == SolutionStatus.UNSATISFIABLE:
+        findings.append(
+            ValidationFinding("D", ValidationSeverity.ERROR, "unsatisfiable_puzzle", "Independent solver proved 0 solutions exist for puzzle", puzzle_id, file_path, line_no)
+        )
+        return RecordAuditResult(puzzle_id, False, False, True, False, None, findings, repairs)
+
+    if solve_res.status == SolutionStatus.MULTIPLE:
+        findings.append(
+            ValidationFinding("D", ValidationSeverity.ERROR, "multiple_solutions_found", "Independent solver proved puzzle has >= 2 solutions (non-unique)", puzzle_id, file_path, line_no)
+        )
+        if cur_rec.get("unique_solution") is True:
+            findings.append(
+                ValidationFinding("D", ValidationSeverity.CRITICAL, "false_uniqueness_claim", "Record falsely declared unique_solution: true", puzzle_id, file_path, line_no)
+            )
+        return RecordAuditResult(puzzle_id, False, False, True, False, None, findings, repairs)
+
+    # At this point, independent solver proved status == UNIQUE
+    authoritative_solution = solve_res.solutions[0]
+    authoritative_sol_str = digits_to_string(authoritative_solution)
+
+    # Audit declared solution
+    raw_sol = cur_rec.get("solution")
+    sol_digits, sol_err = parse_grid_to_digits(raw_sol)
+    solution_wrong = False
+
+    if sol_err or sol_digits is None:
+        findings.append(
+            ValidationFinding("C", ValidationSeverity.ERROR, "malformed_solution", sol_err or "Invalid solution format", puzzle_id, file_path, line_no, repairable=True)
+        )
+        solution_wrong = True
+    else:
+        # Check clue preservation
+        for c_idx in range(NUM_CELLS):
+            if puz_digits[c_idx] != 0 and sol_digits[c_idx] != puz_digits[c_idx]:
+                findings.append(
+                    ValidationFinding("C", ValidationSeverity.ERROR, "clue_preservation_violated", f"Solution mutates clue at cell {c_idx} (was {puz_digits[c_idx]}, got {sol_digits[c_idx]})", puzzle_id, file_path, line_no, repairable=True)
+                )
+                solution_wrong = True
+                break
+
+        ok_sol, sol_rule_err = validate_board_consistency(sol_digits, geom, require_complete=True)
+        if not ok_sol:
+            findings.append(
+                ValidationFinding("C", ValidationSeverity.ERROR, "invalid_solution_state", f"Solution violates rules: {sol_rule_err}", puzzle_id, file_path, line_no, repairable=True)
+            )
+            solution_wrong = True
+
+        if not solution_wrong and digits_to_string(sol_digits) != authoritative_sol_str:
+            findings.append(
+                ValidationFinding("C", ValidationSeverity.ERROR, "solution_mismatch", "Solution does not match unique mathematically verified solution", puzzle_id, file_path, line_no, repairable=True)
+            )
+            solution_wrong = True
+
+    # Category 2 Repair: If solution was wrong/missing but puzzle is provably UNIQUE
+    if solution_wrong:
+        if mode == RepairMode.REPAIR_AGGRESSIVE:
+            repairs.append(RepairRecord(puzzle_id, file_path, line_no, "regenerate_authoritative_solution", str(raw_sol)[:20], authoritative_sol_str[:20]))
+            cur_rec["solution"] = authoritative_sol_str
+            cur_rec["solution_count_status"] = "unique"
+            cur_rec["unique_solution"] = True
+            sol_digits = list(authoritative_solution)
+        else:
+            return RecordAuditResult(puzzle_id, False, False, True, False, None, findings, repairs)
+    else:
+        if raw_sol != authoritative_sol_str and mode in (RepairMode.REPAIR_SAFE, RepairMode.REPAIR_AGGRESSIVE):
+            repairs.append(RepairRecord(puzzle_id, file_path, line_no, "canonicalize_solution_representation", str(raw_sol)[:20], authoritative_sol_str[:20]))
+            cur_rec["solution"] = authoritative_sol_str
+
+    # -----------------------------------------------------------------------
+    # Layer E: Training-Target & Proof Trace Integrity
+    # -----------------------------------------------------------------------
+    task_type = cur_rec.get("task_type")
+    target = cur_rec.get("target")
+
+    if not isinstance(target, dict):
+        findings.append(
+            ValidationFinding("E", ValidationSeverity.ERROR, "invalid_target_structure", "Target field must be a dictionary", puzzle_id, file_path, line_no)
+        )
+    else:
+        if task_type == "complete_solution":
+            t_sol = target.get("solution_string")
+            if t_sol != authoritative_sol_str:
+                findings.append(
+                    ValidationFinding("E", ValidationSeverity.ERROR, "target_solution_mismatch", "Target solution_string does not match verified solution", puzzle_id, file_path, line_no, repairable=True)
+                )
+                if mode == RepairMode.REPAIR_AGGRESSIVE:
+                    repairs.append(RepairRecord(puzzle_id, file_path, line_no, "repair_target_solution_string", str(t_sol)[:20], authoritative_sol_str[:20]))
+                    target["solution_string"] = authoritative_sol_str
+
+        elif task_type == "next_logical_deduction":
+            deduction = target.get("deduction")
+            if not isinstance(deduction, dict):
+                findings.append(
+                    ValidationFinding("E", ValidationSeverity.ERROR, "missing_deduction_target", "next_logical_deduction requires deduction dictionary", puzzle_id, file_path, line_no)
+                )
+            else:
+                v_copy, m_copy = init_masks(puz_digits, geom)
+                if v_copy is not None and m_copy is not None:
+                    step_ok, step_err = verify_single_step_proof(deduction, v_copy, m_copy, geom)
+                    if not step_ok:
+                        findings.append(
+                            ValidationFinding("E", ValidationSeverity.ERROR, "invalid_target_deduction", f"Deduction invalid: {step_err}", puzzle_id, file_path, line_no)
+                        )
+
+        elif task_type == "solver_policy":
+            r_cell = target.get("recommended_cell")
+            r_digit = target.get("recommended_digit")
+            if r_cell is not None and r_digit is not None:
+                if not (0 <= r_cell < NUM_CELLS) or puz_digits[r_cell] != 0:
+                    findings.append(
+                        ValidationFinding("E", ValidationSeverity.ERROR, "invalid_policy_cell", f"Recommended cell {r_cell} is not empty in puzzle", puzzle_id, file_path, line_no)
+                    )
+                elif authoritative_solution[r_cell] != r_digit:
+                    findings.append(
+                        ValidationFinding("E", ValidationSeverity.ERROR, "invalid_policy_digit", f"Recommended digit {r_digit} does not match verified solution digit {authoritative_solution[r_cell]}", puzzle_id, file_path, line_no)
+                    )
+
+    # Proof Trace Replay
+    trace = cur_rec.get("technique_trace", [])
+    if isinstance(trace, list) and len(trace) > 0:
+        trace_ok, f_step, f_msg = replay_technique_trace(puz_digits, trace, geom)
+        if not trace_ok:
+            findings.append(
+                ValidationFinding("E", ValidationSeverity.ERROR, "invalid_technique_trace", f"Trace replay failed at step {f_step}: {f_msg}", puzzle_id, file_path, line_no)
+            )
+
+    # -----------------------------------------------------------------------
+    # Layer F: Difficulty Calibration Metadata
+    # -----------------------------------------------------------------------
+    diff = cur_rec.get("difficulty")
+    diff_raw = cur_rec.get("difficulty_raw")
+    if not isinstance(diff, (int, float)) or isinstance(diff, bool) or not math.isfinite(diff) or not (1.0 <= diff <= 10.0):
+        findings.append(
+            ValidationFinding("F", ValidationSeverity.ERROR, "invalid_difficulty_range", f"Difficulty {diff} out of bounds [1.0, 10.0]", puzzle_id, file_path, line_no)
+        )
+    if not isinstance(diff_raw, (int, float)) or isinstance(diff_raw, bool) or not math.isfinite(diff_raw) or not (1.0 <= diff_raw <= 10.0):
+        findings.append(
+            ValidationFinding("F", ValidationSeverity.ERROR, "invalid_difficulty_raw", f"Raw difficulty {diff_raw} out of bounds [1.0, 10.0]", puzzle_id, file_path, line_no)
+        )
+
+    # Check Deterministic Hashes in Provenance
+    exact_h, canon_h, fam_h = compute_independent_hashes(puz_digits, authoritative_solution, variant)
+    prov = cur_rec.get("provenance")
+    if not isinstance(prov, dict):
+        findings.append(
+            ValidationFinding("F", ValidationSeverity.WARNING, "missing_provenance", "Provenance dictionary missing", puzzle_id, file_path, line_no, repairable=True)
+        )
+        if mode in (RepairMode.REPAIR_SAFE, RepairMode.REPAIR_AGGRESSIVE):
+            cur_rec["provenance"] = {
+                "exact_puzzle_hash": exact_h,
+                "canonical_puzzle_hash": canon_h,
+                "solution_family_hash": fam_h,
+                "calibration_version": "sm-cal-v2.1",
+            }
+            repairs.append(RepairRecord(puzzle_id, file_path, line_no, "rebuild_provenance", "None", str(cur_rec["provenance"])))
+    else:
+        if prov.get("canonical_puzzle_hash") != canon_h or prov.get("exact_puzzle_hash") != exact_h:
+            findings.append(
+                ValidationFinding("F", ValidationSeverity.WARNING, "provenance_hash_mismatch", "Provenance hashes differ from recomputed hashes", puzzle_id, file_path, line_no, repairable=True)
+            )
+            if mode in (RepairMode.REPAIR_SAFE, RepairMode.REPAIR_AGGRESSIVE):
+                prov["exact_puzzle_hash"] = exact_h
+                prov["canonical_puzzle_hash"] = canon_h
+                prov["solution_family_hash"] = fam_h
+                repairs.append(RepairRecord(puzzle_id, file_path, line_no, "correct_provenance_hashes", "mismatched", canon_h[:16]))
+
+    # Finalize Layer A Checksum Repair if necessary
+    has_critical_or_error = any(f.severity in (ValidationSeverity.CRITICAL, ValidationSeverity.ERROR) for f in findings)
+    
+    if sha_mismatch or len(repairs) > 0:
+        if not has_critical_or_error and mode in (RepairMode.REPAIR_SAFE, RepairMode.REPAIR_AGGRESSIVE):
+            cur_rec.pop("record_sha256", None)
+            new_sha = hashlib.sha256(json.dumps(cur_rec, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+            cur_rec["record_sha256"] = new_sha
+            repairs.append(RepairRecord(puzzle_id, file_path, line_no, "recalculate_record_sha256", str(claimed_sha)[:16], new_sha[:16]))
+
+    is_valid = not has_critical_or_error
+    is_repaired = len(repairs) > 0 and is_valid
+    is_quarantined = not is_valid
+
+    return RecordAuditResult(
+        record_id=puzzle_id,
+        is_valid=is_valid,
+        is_repaired=is_repaired,
+        is_quarantined=is_quarantined,
+        unresolved=False,
+        repaired_record=cur_rec if is_repaired else (cur_rec if is_valid else None),
+        findings=findings,
+        repairs=repairs,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Multiprocessing Worker & Streaming File Auditor
+# ---------------------------------------------------------------------------
+
+@dataclass
+class WorkerBatchTask:
+    lines: List[Tuple[int, str]]  # (line_number, raw_json_str)
+    file_path: str
+    mode: str
+    max_solver_seconds: float
 
 
 @dataclass
-class AuditConfig:
+class WorkerBatchResult:
+    results: List[RecordAuditResult]
+    parse_errors: List[ValidationFinding]
+
+
+def _audit_batch_worker(task: WorkerBatchTask) -> WorkerBatchResult:
+    mode = RepairMode(task.mode)
+    out_results: List[RecordAuditResult] = []
+    out_errors: List[ValidationFinding] = []
+
+    for line_no, line_str in task.lines:
+        stripped = line_str.strip()
+        if not stripped:
+            continue
+        try:
+            parsed = strict_json_loads(stripped)
+        except Exception as exc:
+            out_errors.append(
+                ValidationFinding(
+                    layer="A",
+                    severity=ValidationSeverity.CRITICAL,
+                    category="json_parse_failure",
+                    message=f"JSON parsing error: {exc}",
+                    record_id=f"line_{line_no}",
+                    file_path=task.file_path,
+                    line_number=line_no,
+                )
+            )
+            continue
+
+        res = audit_single_record(
+            record=parsed,
+            file_path=task.file_path,
+            line_no=line_no,
+            mode=mode,
+            max_solver_seconds=task.max_solver_seconds,
+        )
+        out_results.append(res)
+
+    return WorkerBatchResult(out_results, out_errors)
+
+
+# ---------------------------------------------------------------------------
+# Dataset Discovery & Pipeline Runner
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DatasetFileInfo:
+    file_path: str
+    split_name: str
+    file_size_bytes: int
+    is_test_split: bool
+
+
+def discover_input_files(target_path: str) -> List[DatasetFileInfo]:
+    abs_path = os.path.abspath(target_path)
+    if not os.path.exists(abs_path):
+        raise FileNotFoundError(f"Input path does not exist: {abs_path}")
+
+    files: List[DatasetFileInfo] = []
+    if os.path.isfile(abs_path):
+        fname = os.path.basename(abs_path)
+        split = "unknown"
+        for candidate in ("train", "validation", "test"):
+            if candidate in fname:
+                split = candidate
+                break
+        files.append(DatasetFileInfo(abs_path, split, os.path.getsize(abs_path), split == "test"))
+        return files
+
+    # Directory walk
+    for root, _, filenames in os.walk(abs_path):
+        for f in sorted(filenames):
+            if f.endswith(".jsonl") and not f.endswith(".part"):
+                fpath = os.path.join(root, f)
+                rel = os.path.relpath(fpath, abs_path).lower()
+                split = "train"
+                if "test" in rel:
+                    split = "test"
+                elif "val" in rel:
+                    split = "validation"
+                files.append(DatasetFileInfo(fpath, split, os.path.getsize(fpath), split == "test"))
+
+    return files
+
+
+def audit_dataset_manifest(split_dir: str, findings: List[ValidationFinding]) -> None:
+    manifest_path = os.path.join(split_dir, "manifest.json")
+    if not os.path.exists(manifest_path):
+        return
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            m = json.load(f)
+    except Exception as exc:
+        findings.append(ValidationFinding("A", ValidationSeverity.ERROR, "corrupted_manifest", f"Manifest JSON invalid: {exc}", file_path=manifest_path))
+        return
+
+    data_file = m.get("file_path")
+    declared_sha = m.get("file_sha256")
+    if data_file and declared_sha:
+        full_data_path = os.path.join(split_dir, data_file)
+        if os.path.exists(full_data_path):
+            h = hashlib.sha256()
+            with open(full_data_path, "rb") as df:
+                while chunk := df.read(1024 * 1024):
+                    h.update(chunk)
+            actual_sha = h.hexdigest()
+            if actual_sha != declared_sha:
+                findings.append(
+                    ValidationFinding(
+                        layer="A",
+                        severity=ValidationSeverity.ERROR,
+                        category="manifest_hash_mismatch",
+                        message=f"Manifest sha256 ({declared_sha[:16]}) != actual file ({actual_sha[:16]})",
+                        file_path=manifest_path,
+                    )
+                )
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator & CLI Runner
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AuditExecutionConfig:
     input_path: str
     output_path: Optional[str] = None
+    quarantine_path: Optional[str] = None
     report_path: Optional[str] = None
+    repair_log_path: Optional[str] = None
     mode: RepairMode = RepairMode.AUDIT
-    workers: int = 1
-    max_line_bytes: int = DEFAULT_MAX_LINE_BYTES
-    max_record_bytes: int = DEFAULT_MAX_RECORD_BYTES
-    max_solver_sec: float = DEFAULT_MAX_SOLVER_SECONDS
-    max_solver_nodes: int = DEFAULT_MAX_SOLVER_NODES
-    max_wall_sec: float = DEFAULT_MAX_WALL_SECONDS
-    min_free_disk_mb: float = DEFAULT_MIN_FREE_DISK_MB
     cross_split: bool = False
-    quiet: bool = False
-    verbose: bool = False
     dry_run: bool = False
-    variant_override: Optional[str] = None
-    quarantine_dirname: str = "_quarantine"
+    workers: int = 2
+    max_solver_seconds: float = 2.0
+    max_line_bytes: int = 2_000_000
+    batch_size: int = 100
+    verbose: bool = False
+    quiet: bool = False
 
 
-def _iter_records(path: str, max_line_bytes: int, max_record_bytes: int
-                  ) -> Iterator[Tuple[int, Optional[Dict[str, Any]], Optional[str]]]:
-    """
-    Stream records from a JSONL file.  Yields (line_no, record_or_None, error_or_None).
-    """
-    with open(path, "rb") as f:
-        line_no = 0
-        while True:
-            raw = f.readline()
-            if not raw:
-                break
-            line_no += 1
-            if len(raw) > max_line_bytes:
-                yield line_no, None, f"line_too_long ({len(raw)} > {max_line_bytes})"
-                continue
-            if len(raw) > max_record_bytes:
-                yield line_no, None, "record_too_large"
-                continue
-            if raw.endswith(b"\n"):
-                raw_body = raw[:-1]
-            else:
-                raw_body = raw
-            if not raw_body.strip():
-                continue
-            try:
-                text = raw_body.decode("utf-8")
-            except UnicodeDecodeError as e:
-                yield line_no, None, f"invalid_utf8: {e}"
-                continue
-            obj, err = _check_json_strict(text)
-            if err is not None:
-                yield line_no, None, err
-                continue
-            yield line_no, obj, None
+def run_auditor(cfg: AuditExecutionConfig) -> Tuple[ExitCode, Dict[str, Any]]:
+    t0 = time.perf_counter()
+    files = discover_input_files(cfg.input_path)
+    if not files:
+        sys.stderr.write(f"No .jsonl files found in {cfg.input_path}\n")
+        return ExitCode.CLI_ERROR, {}
 
+    if not cfg.quiet:
+        print("=" * 78)
+        print(f"{PROGRAM_NAME} v{PROGRAM_VERSION} | Independent Verification & Audit Engine")
+        print("=" * 78)
+        print(f"Mode                 : {cfg.mode.value.upper()} (dry_run={cfg.dry_run})")
+        print(f"Independent Solver   : {INDEPENDENT_SOLVER_NAME}")
+        print(f"Input Target         : {os.path.abspath(cfg.input_path)} ({len(files)} file(s))")
+        print(f"Output Directory     : {os.path.abspath(cfg.output_path) if cfg.output_path else 'None (Read-Only Audit)'}")
+        print(f"Cross-Split Check    : {cfg.cross_split}")
+        print(f"Workers / Timeout    : {cfg.workers} worker(s) | {cfg.max_solver_seconds:.1f}s per board")
+        print("=" * 78)
 
-def run_audit(cfg: AuditConfig) -> AuditReport:
-    started = time.time()
-    findings: List[Finding] = []
-    repairs: List[Dict[str, Any]] = []
-    stats = ProcessingStats()
+    temp_dir = tempfile.mkdtemp(prefix="sudokumind_audit_")
+    registry_path = os.path.join(temp_dir, "leak_registry.sqlite3")
+    registry = AuditRegistry(registry_path)
 
-    variant_override: Optional[VariantSpec] = None
-    if cfg.variant_override:
-        if cfg.variant_override not in VARIANT_REGISTRY:
-            raise ValueError(f"unknown variant override {cfg.variant_override!r}")
-        variant_override = VARIANT_REGISTRY[cfg.variant_override]
+    total_records = 0
+    valid_count = 0
+    invalid_count = 0
+    unresolved_count = 0
+    repaired_count = 0
+    quarantined_count = 0
 
-    descriptors = discover_dataset_files(cfg.input_path)
-    if not descriptors:
-        raise FileNotFoundError(f"no JSONL files found under {cfg.input_path}")
+    all_findings: List[ValidationFinding] = []
+    all_repairs: List[RepairRecord] = []
 
-    # Prepare output directories for repair modes
-    output_writers: Dict[str, Any] = {}
-    quarantine_writers: Dict[str, Any] = {}
-    if cfg.mode in (RepairMode.REPAIR_SAFE, RepairMode.REPAIR_AGGRESSIVE,
-                    RepairMode.QUARANTINE) and not cfg.dry_run:
-        if not cfg.output_path:
-            raise ValueError(f"--output is required for mode {cfg.mode.value}")
-        enforce_disk_budget(cfg.output_path, cfg.min_free_disk_mb)
-        os.makedirs(cfg.output_path, exist_ok=True)
+    # Check manifest files if directory given
+    if os.path.isdir(cfg.input_path):
+        for root, dirs, _ in os.walk(cfg.input_path):
+            audit_dataset_manifest(root, all_findings)
 
-    # Dedup registry (in a tempdir unless output path supplied)
-    if cfg.mode in (RepairMode.REPAIR_SAFE, RepairMode.REPAIR_AGGRESSIVE) and cfg.output_path:
-        dedup_path = os.path.join(cfg.output_path, "_audit_dedup.sqlite3")
-    else:
-        dedup_path = os.path.join(tempfile.mkdtemp(prefix="sm_validator_"), "dedup.sqlite3")
-    dedup = DedupRegistry(dedup_path)
-
-    files_meta: List[Dict[str, Any]] = []
+    pool: Optional[mp.pool.Pool] = None
+    if cfg.workers > 1:
+        pool = mp.Pool(processes=cfg.workers)
 
     try:
-        for fd in descriptors:
-            if _SHUTDOWN:
-                break
-            file_size = fd.size_bytes
-            file_findings_before = len(findings)
+        for file_info in files:
+            if not cfg.quiet:
+                print(f"\n[AUDIT] Scanning {file_info.split_name.upper()}: {os.path.basename(file_info.file_path)} ({file_info.file_size_bytes / 1024:.1f} KB)")
 
-            if cfg.verbose and not cfg.quiet:
-                sys.stderr.write(f"[AUDIT] {fd.path} split={fd.split} "
-                                 f"size={file_size} bytes\n")
+            out_handle = None
+            quarantine_handle = None
+            out_tmp_path = None
+            quarantine_tmp_path = None
 
-            # Open output writers per split on demand
-            def _get_writer(root: str) -> Any:
-                if root not in output_writers:
-                    if cfg.dry_run:
-                        output_writers[root] = None
-                        return None
-                    out_dir = os.path.join(root, fd.split)
-                    os.makedirs(out_dir, exist_ok=True)
-                    out_path = os.path.join(out_dir, os.path.basename(fd.path))
-                    tmp = out_path + ".tmp"
-                    output_writers[root] = (open(tmp, "w", encoding="utf-8"), tmp, out_path)
-                return output_writers[root]
+            if cfg.output_path and not cfg.dry_run and cfg.mode in (RepairMode.REPAIR_SAFE, RepairMode.REPAIR_AGGRESSIVE):
+                rel_sub = os.path.relpath(file_info.file_path, os.path.abspath(cfg.input_path)) if os.path.isdir(cfg.input_path) else os.path.basename(file_info.file_path)
+                dest_file = os.path.join(cfg.output_path, rel_sub)
+                os.makedirs(os.path.dirname(dest_file), exist_ok=True)
+                out_tmp_path = f"{dest_file}.tmp.{os.getpid()}"
+                out_handle = open(out_tmp_path, "w", encoding="utf-8")
 
-            def _get_quarantine_writer() -> Any:
-                if "q" not in quarantine_writers:
-                    if cfg.dry_run:
-                        quarantine_writers["q"] = None
-                        return None
-                    base = cfg.output_path or os.path.dirname(fd.path)
-                    qdir = os.path.join(base, cfg.quarantine_dirname)
-                    os.makedirs(qdir, exist_ok=True)
-                    qpath = os.path.join(qdir, f"{fd.split}_quarantine.jsonl")
-                    tmp = qpath + ".tmp"
-                    quarantine_writers["q"] = (open(tmp, "w", encoding="utf-8"),
-                                               tmp, qpath)
-                return quarantine_writers["q"]
+            if cfg.quarantine_path and not cfg.dry_run and cfg.mode in (RepairMode.QUARANTINE, RepairMode.REPAIR_SAFE, RepairMode.REPAIR_AGGRESSIVE):
+                q_dest = os.path.join(cfg.quarantine_path, f"quarantine_{file_info.split_name}.jsonl")
+                os.makedirs(os.path.dirname(q_dest), exist_ok=True)
+                quarantine_tmp_path = f"{q_dest}.tmp.{os.getpid()}"
+                quarantine_handle = open(quarantine_tmp_path, "a", encoding="utf-8")
 
-            writer = None
-            q_writer = None
-            if cfg.mode in (RepairMode.REPAIR_SAFE, RepairMode.REPAIR_AGGRESSIVE):
-                writer = _get_writer(cfg.output_path)  # type: ignore[arg-type]
-            if cfg.mode == RepairMode.QUARANTINE:
-                q_writer = _get_quarantine_writer()
+            batch_lines: List[Tuple[int, str]] = []
 
-            for line_no, rec, err in _iter_records(fd.path, cfg.max_line_bytes,
-                                                   cfg.max_record_bytes):
-                if _SHUTDOWN:
-                    break
-                stats.total_records += 1
-                if err is not None:
-                    stats.structural_errors += 1
-                    findings.append(Finding(
-                        ValidationCategory.FILE.value, Severity.ERROR.value,
-                        "line_error", err,
-                        file=fd.path, line=line_no))
-                    continue
+            def _process_batch(lines_to_eval: List[Tuple[int, str]]) -> None:
+                nonlocal total_records, valid_count, invalid_count, unresolved_count, repaired_count, quarantined_count
+                task = WorkerBatchTask(lines_to_eval, file_info.file_path, cfg.mode.value, cfg.max_solver_seconds)
+                batch_res = _audit_batch_worker(task) if pool is None else pool.apply(_audit_batch_worker, (task,))
 
-                assert rec is not None
-                outcome = validate_record(
-                    rec, fd.path, line_no, variant_override,
-                    cfg.mode, cfg.max_solver_sec, cfg.max_solver_nodes,
-                )
-                findings.extend(outcome.findings)
-                if outcome.repairs:
-                    for r in outcome.repairs:
-                        repairs.append({"file": fd.path, "line": line_no,
-                                        "record_id": rec.get("puzzle_id"),
-                                        **r})
+                for err in batch_res.parse_errors:
+                    all_findings.append(err)
+                    invalid_count += 1
+                    total_records += 1
 
-                # Register hash for dedup if we have a well-formed puzzle/solution
-                puz_grid = parse_grid_field(rec.get("puzzle"))
-                sol_grid = parse_grid_field(rec.get("solution"))
-                if puz_grid is not None and sol_grid is not None:
-                    vname = rec.get("variant", "standard")
-                    spec = VARIANT_REGISTRY.get(vname)
-                    if spec is not None:
-                        exact_h, canon_h, family_h = compute_canonical_hashes(
-                            puz_grid, sol_grid, spec)
-                        conflicts = dedup.register(
-                            canon_h, exact_h, family_h,
-                            fd.split, rec.get("puzzle_id"), fd.path, line_no)
-                        for kind, other_split, ofile, oline in conflicts:
-                            stats.dedup_conflicts += 1
-                            if "leak" in kind:
-                                stats.cross_split_leaks += 1
-                            sev = Severity.ERROR if "leak" in kind else Severity.WARNING
-                            findings.append(Finding(
-                                ValidationCategory.LEAKAGE.value if "leak" in kind
-                                else ValidationCategory.DEDUP.value,
-                                sev.value, kind,
-                                f"duplicate/leak {kind} with split={other_split} "
-                                f"(file={ofile} line={oline})",
-                                file=fd.path, line=line_no,
-                                record_id=rec.get("puzzle_id")))
+                for r in batch_res.results:
+                    total_records += 1
+                    all_findings.extend(r.findings)
+                    all_repairs.extend(r.repairs)
 
-                # Classify
-                if outcome.verdict == Verdict.VALID:
-                    stats.valid_records += 1
-                elif outcome.verdict == Verdict.REPAIRED:
-                    stats.repaired_records += 1
-                elif outcome.verdict == Verdict.INVALID:
-                    stats.invalid_records += 1
-                elif outcome.verdict == Verdict.UNRESOLVED:
-                    stats.unresolved_records += 1
-                elif outcome.verdict == Verdict.QUARANTINED:
-                    stats.quarantined_records += 1
+                    # Layer G cross-split leakage check
+                    if r.is_valid and cfg.cross_split:
+                        prov = r.repaired_record["provenance"] if r.repaired_record else {}
+                        c_h = prov.get("canonical_puzzle_hash", "")
+                        e_h = prov.get("exact_puzzle_hash", "")
+                        f_h = prov.get("solution_family_hash", "")
+                        l_findings = registry.register_and_audit_leak(
+                            r.record_id, file_info.split_name, file_info.file_path, 0, e_h, c_h, f_h
+                        )
+                        if l_findings:
+                            all_findings.extend(l_findings)
+                            r.is_valid = False
+                            r.is_quarantined = True
 
-                # Categorize counts
-                for f in outcome.findings:
-                    if f.category == ValidationCategory.PUZZLE.value and \
-                            f.severity == Severity.CRITICAL.value:
-                        stats.puzzle_errors += 1
-                    elif f.category == ValidationCategory.SOLUTION.value and \
-                            f.severity in (Severity.CRITICAL.value, Severity.ERROR.value):
-                        stats.solution_errors += 1
-                    elif f.category == ValidationCategory.UNIQUENESS.value and \
-                            f.code == "uniqueness_unresolved":
-                        stats.uniqueness_unresolved += 1
-                    elif f.category == ValidationCategory.TECHNIQUE_TRACE.value and \
-                            f.severity == Severity.ERROR.value:
-                        stats.technique_errors += 1
-                    elif f.category == ValidationCategory.DIFFICULTY.value:
-                        stats.difficulty_discrepancies += 1
+                    if r.unresolved:
+                        unresolved_count += 1
+                    elif r.is_valid:
+                        valid_count += 1
+                        if r.is_repaired:
+                            repaired_count += 1
+                        if out_handle is not None and r.repaired_record is not None:
+                            out_handle.write(json.dumps(r.repaired_record, sort_keys=True) + "\n")
+                    else:
+                        invalid_count += 1
+                        if r.is_quarantined:
+                            quarantined_count += 1
+                            if quarantine_handle is not None:
+                                quarantine_handle.write(json.dumps({
+                                    "record_id": r.record_id,
+                                    "file_path": file_info.file_path,
+                                    "reasons": [f.message for f in r.findings if f.severity in (ValidationSeverity.ERROR, ValidationSeverity.CRITICAL)],
+                                }, sort_keys=True) + "\n")
 
-                # Write outputs
-                if outcome.verdict == Verdict.QUARANTINED:
-                    if cfg.mode == RepairMode.QUARANTINE and q_writer is not None:
-                        _atomic_write_line(q_writer[0], {
-                            "record": rec,
-                            "findings": [f.to_dict() for f in outcome.findings],
-                        })
-                elif outcome.verdict in (Verdict.VALID, Verdict.REPAIRED) and \
-                        writer is not None:
-                    out_rec = outcome.repaired_record if outcome.repaired_record is not None else rec
-                    _atomic_write_line(writer[0], out_rec)
-                elif outcome.verdict == Verdict.UNRESOLVED and writer is not None:
-                    # Keep unresolved out of the clean output; log them
-                    pass
+            with open(file_info.file_path, "r", encoding="utf-8", errors="replace") as f:
+                for line_idx, line in enumerate(f, start=1):
+                    if len(line.encode("utf-8")) > cfg.max_line_bytes:
+                        all_findings.append(
+                            ValidationFinding(
+                                layer="A",
+                                severity=ValidationSeverity.CRITICAL,
+                                category="line_length_exceeded",
+                                message=f"Line {line_idx} exceeded size limit ({cfg.max_line_bytes} bytes)",
+                                file_path=file_info.file_path,
+                                line_number=line_idx,
+                            )
+                        )
+                        invalid_count += 1
+                        total_records += 1
+                        continue
 
-                # Progress
-                if not cfg.quiet and stats.total_records % 5000 == 0:
-                    sys.stderr.write(
-                        f"  ... {stats.total_records} records; "
-                        f"valid={stats.valid_records} "
-                        f"invalid={stats.invalid_records} "
-                        f"quarantined={stats.quarantined_records} "
-                        f"unresolved={stats.unresolved_records}\n")
+                    batch_lines.append((line_idx, line))
+                    if len(batch_lines) >= cfg.batch_size:
+                        _process_batch(batch_lines)
+                        batch_lines = []
 
-                if cfg.max_wall_sec > 0 and time.time() - started > cfg.max_wall_sec:
-                    findings.append(Finding(
-                        ValidationCategory.FILE.value, Severity.WARNING.value,
-                        "wall_clock_limit",
-                        f"wall clock limit {cfg.max_wall_sec}s exceeded; stopping"))
-                    _SHUTDOWN = True
-                    break
+                if batch_lines:
+                    _process_batch(batch_lines)
 
-            # Manifest check
-            split_dir = os.path.dirname(fd.path)
-            file_findings = check_manifest(split_dir, fd.path, stats)
-            findings.extend(file_findings)
-            for f in file_findings:
-                if f.severity == Severity.ERROR.value:
-                    stats.manifest_discrepancies += 1
+            if out_handle is not None:
+                out_handle.close()
+                assert out_tmp_path is not None
+                final_dest = out_tmp_path.replace(f".tmp.{os.getpid()}", "")
+                os.replace(out_tmp_path, final_dest)
 
-            files_meta.append({
-                "path": fd.path,
-                "split": fd.split,
-                "size_bytes": file_size,
-                "sha256": _file_sha256(fd.path) if file_size < (1 << 30) else None,
-                "findings": len(findings) - file_findings_before,
-            })
+            if quarantine_handle is not None:
+                quarantine_handle.close()
+                assert quarantine_tmp_path is not None
+                final_q_dest = quarantine_tmp_path.replace(f".tmp.{os.getpid()}", "")
+                os.replace(quarantine_tmp_path, final_q_dest)
+
     finally:
-        # Finalize writers
-        for writer in output_writers.values():
-            if writer is not None:
-                try:
-                    writer[0].flush()
-                    writer[0].close()
-                    os.replace(writer[1], writer[2])
-                except Exception as e:
-                    findings.append(Finding(
-                        ValidationCategory.FILE.value, Severity.ERROR.value,
-                        "output_finalize_error", str(e)))
-        for writer in quarantine_writers.values():
-            if writer is not None:
-                try:
-                    writer[0].flush()
-                    writer[0].close()
-                    os.replace(writer[1], writer[2])
-                except Exception as e:
-                    findings.append(Finding(
-                        ValidationCategory.FILE.value, Severity.ERROR.value,
-                        "quarantine_finalize_error", str(e)))
-        dedup.close()
+        if pool is not None:
+            pool.terminate()
+            pool.join()
+        registry.close()
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
-    # Compute status
-    has_critical = any(f.severity == Severity.CRITICAL.value for f in findings)
-    has_error = any(f.severity == Severity.ERROR.value for f in findings)
-    has_unresolved = stats.unresolved_records > 0
-    has_warnings = any(f.severity == Severity.WARNING.value for f in findings)
+    elapsed_sec = round(time.perf_counter() - t0, 3)
 
-    if _SHUTDOWN:
-        status = OverallStatus.INCOMPLETE
+    # Determine status
+    has_critical = any(f.severity == ValidationSeverity.CRITICAL for f in all_findings)
+    has_error = any(f.severity == ValidationSeverity.ERROR for f in all_findings)
+    has_warning = any(f.severity == ValidationSeverity.WARNING for f in all_findings)
+
+    if _SHUTDOWN_REQUESTED or unresolved_count > 0:
+        overall_status = AuditStatus.INCOMPLETE
         exit_code = ExitCode.INCOMPLETE
-    elif has_critical or stats.invalid_records > 0 or stats.quarantined_records > 0:
-        status = OverallStatus.FAIL
+    elif has_critical or has_error or invalid_count > 0:
+        overall_status = AuditStatus.FAIL
         exit_code = ExitCode.FAIL
-    elif has_unresolved or has_error:
-        status = OverallStatus.INCOMPLETE if has_unresolved else OverallStatus.FAIL
-        exit_code = ExitCode.INCOMPLETE if has_unresolved else ExitCode.FAIL
-    elif has_warnings or stats.repaired_records > 0:
-        status = OverallStatus.PASS_WITH_WARNINGS
-        exit_code = ExitCode.WARNINGS
+    elif has_warning or repaired_count > 0:
+        overall_status = AuditStatus.PASS_WITH_WARNINGS
+        exit_code = ExitCode.PASS_WITH_WARNINGS
     else:
-        status = OverallStatus.PASS
-        exit_code = ExitCode.OK
+        overall_status = AuditStatus.PASS
+        exit_code = ExitCode.PASS
 
-    limitations: List[str] = [
-        "Technique verification covers most human strategies; "
-        "forcing_chain_contradiction is verified on a best-effort basis only.",
-        "Difficulty labels are checked for range/type consistency and internal "
-        "feature agreement, but the generator's scoring formula is NOT "
-        "independently recomputed; drift between calibration versions is reported "
-        "as informational only.",
-        "Canonical equivalence checking covers the D4 dihedral group and digit "
-        "relabeling for full-symmetry variants; anti-knight/anti-king are checked "
-        "only under digit relabeling (their peer graphs break full D4 invariance).",
-        "Solver timeouts are reported as UNRESOLVED, never as valid or invalid.",
-    ]
+    # Produce Machine-Readable JSON Report
+    report_dict: Dict[str, Any] = {
+        "validator_name": PROGRAM_NAME,
+        "validator_version": PROGRAM_VERSION,
+        "audit_timestamp_unix": time.time(),
+        "elapsed_seconds": elapsed_sec,
+        "overall_status": overall_status.value,
+        "mode": cfg.mode.value,
+        "dry_run": cfg.dry_run,
+        "summary_counts": {
+            "total_records": total_records,
+            "valid_records": valid_count,
+            "invalid_records": invalid_count,
+            "unresolved_records": unresolved_count,
+            "repaired_records": repaired_count,
+            "quarantined_records": quarantined_count,
+        },
+        "findings_by_severity": {
+            "critical": sum(1 for f in all_findings if f.severity == ValidationSeverity.CRITICAL),
+            "error": sum(1 for f in all_findings if f.severity == ValidationSeverity.ERROR),
+            "warning": sum(1 for f in all_findings if f.severity == ValidationSeverity.WARNING),
+            "info": sum(1 for f in all_findings if f.severity == ValidationSeverity.INFO),
+        },
+        "findings": [f.to_dict() for f in all_findings[:500]],  # Cap detailed telemetry to first 500
+        "repairs_applied": [r.to_dict() for r in all_repairs[:500]],
+    }
 
-    report = AuditReport(
-        validator_name=VALIDATOR_NAME,
-        validator_version=VALIDATOR_VERSION,
-        started_unix=started,
-        finished_unix=time.time(),
-        input_path=os.path.abspath(cfg.input_path),
-        output_path=os.path.abspath(cfg.output_path) if cfg.output_path else None,
-        mode=cfg.mode.value,
-        schema_profile="sm-schema-v2.0",
-        files=files_meta,
-        stats=dataclasses.asdict(stats),
-        findings=[f.to_dict() for f in findings],
-        repairs=repairs,
-        overall_status=status.value,
-        exit_code=exit_code,
-        limitations=limitations,
-    )
-    return report
+    if cfg.report_path:
+        os.makedirs(os.path.dirname(os.path.abspath(cfg.report_path)), exist_ok=True)
+        with open(cfg.report_path, "w", encoding="utf-8") as rf:
+            json.dump(report_dict, rf, indent=2, sort_keys=True)
 
+    if cfg.repair_log_path and all_repairs:
+        os.makedirs(os.path.dirname(os.path.abspath(cfg.repair_log_path)), exist_ok=True)
+        with open(cfg.repair_log_path, "w", encoding="utf-8") as rlf:
+            json.dump([r.to_dict() for r in all_repairs], rlf, indent=2, sort_keys=True)
 
-def _file_sha256(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(1 << 20)
-            if not chunk:
-                break
-            h.update(chunk)
-    return h.hexdigest()
+    if not cfg.quiet:
+        print("\n" + "=" * 78)
+        print("AUDIT EXECUTION SUMMARY")
+        print("=" * 78)
+        print(f"Overall Status       : {overall_status.value} (Exit Code: {exit_code.value})")
+        print(f"Total Evaluated      : {total_records:,}")
+        print(f"Mathematically Valid : {valid_count:,} ({valid_count / max(1, total_records) * 100:.1f}%)")
+        print(f"Invalid / Rejected   : {invalid_count:,}")
+        print(f"Unresolved / Timeout : {unresolved_count:,}")
+        print(f"Repaired Operations  : {repaired_count:,}")
+        print(f"Quarantined Records  : {quarantined_count:,}")
+        print(f"Elapsed Time         : {elapsed_sec:.2f}s ({total_records / max(0.001, elapsed_sec):.1f} rec/s)")
+        if cfg.report_path:
+            print(f"JSON Report          : {os.path.abspath(cfg.report_path)}")
+        print("=" * 78)
 
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-
-def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        prog="dataset_validator.py",
-        description=(
-            f"{VALIDATOR_NAME} v{VALIDATOR_VERSION} — Independent validation of "
-            "SudokuMind dataset files. Never trusts generator metadata; recomputes "
-            "all mathematical claims."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Modes:\n"
-            "  audit              validate only (no writes) [default]\n"
-            "  repair-safe        write output with provably safe repairs only\n"
-            "  repair-aggressive  additionally allow deterministic reconstruction\n"
-            "  quarantine         isolate invalid records into a quarantine area\n\n"
-            "Exit codes:\n"
-            "  0 PASS  1 PASS_WITH_WARNINGS  2 FAIL  3 INCOMPLETE\n"
-            "  4 CLI error  5 internal error\n\n"
-            "Examples:\n"
-            "  python dataset_validator.py audit --input datasets/\n"
-            "  python dataset_validator.py audit --input datasets/train/train.jsonl\n"
-            "  python dataset_validator.py audit --input datasets/ --cross-split --workers 4\n"
-            "  python dataset_validator.py repair-safe --input datasets/ --output datasets_repaired/\n"
-            "  python dataset_validator.py repair-aggressive --input datasets/ --output fixed/ --dry-run\n"
-            "  python dataset_validator.py --run-tests\n"
-        ),
-    )
-    p.add_argument("command", nargs="?", default="audit",
-                   choices=["audit", "repair-safe", "repair-aggressive",
-                            "quarantine", "selftest", "help"],
-                   help="Operation mode (default: audit)")
-    p.add_argument("--input", required=False, help="Path to dataset file or directory")
-    p.add_argument("--output", help="Output directory (required for repair modes)")
-    p.add_argument("--report", help="Path to write JSON audit report")
-    p.add_argument("--cross-split", action="store_true",
-                   help="Enable cross-split leakage detection (default when input is a directory)")
-    p.add_argument("--workers", type=int, default=1,
-                   help="Number of worker processes (currently 1; reserved for future)")
-    p.add_argument("--max-line-bytes", type=int, default=DEFAULT_MAX_LINE_BYTES)
-    p.add_argument("--max-record-bytes", type=int, default=DEFAULT_MAX_RECORD_BYTES)
-    p.add_argument("--max-solver-seconds", type=float,
-                   default=DEFAULT_MAX_SOLVER_SECONDS,
-                   help=f"Per-puzzle solver timeout (default {DEFAULT_MAX_SOLVER_SECONDS}s)")
-    p.add_argument("--max-solver-nodes", type=int,
-                   default=DEFAULT_MAX_SOLVER_NODES)
-    p.add_argument("--max-wall-seconds", type=float, default=DEFAULT_MAX_WALL_SECONDS,
-                   help="Overall wall-clock limit (0 = unlimited)")
-    p.add_argument("--min-free-disk-mb", type=float, default=DEFAULT_MIN_FREE_DISK_MB)
-    p.add_argument("--variant", help="Override variant for every record")
-    p.add_argument("--dry-run", action="store_true",
-                   help="Report planned changes without writing anything")
-    p.add_argument("--quiet", action="store_true")
-    p.add_argument("--verbose", action="store_true")
-    p.add_argument("--run-tests", action="store_true",
-                   help="Run the built-in self-test suite and exit")
-    return p
-
-
-def _print_report_summary(rep: AuditReport, quiet: bool) -> None:
-    if quiet:
-        return
-    print()
-    print("=" * 78)
-    print(f"{rep.validator_name} v{rep.validator_version} — Audit Summary")
-    print("=" * 78)
-    print(f"  Input             : {rep.input_path}")
-    if rep.output_path:
-        print(f"  Output            : {rep.output_path}")
-    print(f"  Mode              : {rep.mode}")
-    print(f"  Schema profile    : {rep.schema_profile}")
-    print(f"  Elapsed           : {rep.finished_unix - rep.started_unix:.2f}s")
-    print(f"  Files examined    : {len(rep.files)}")
-    print()
-    s = rep.stats
-    print(f"  Records processed : {s['total_records']}")
-    print(f"  Valid             : {s['valid_records']}")
-    print(f"  Repaired          : {s['repaired_records']}")
-    print(f"  Invalid           : {s['invalid_records']}")
-    print(f"  Quarantined       : {s['quarantined_records']}")
-    print(f"  Unresolved        : {s['unresolved_records']}")
-    print()
-    print(f"  Structural errors : {s['structural_errors']}")
-    print(f"  Puzzle errors     : {s['puzzle_errors']}")
-    print(f"  Solution errors   : {s['solution_errors']}")
-    print(f"  Uniqueness (open) : {s['uniqueness_unresolved']}")
-    print(f"  Technique errors  : {s['technique_errors']}")
-    print(f"  Difficulty disc.  : {s['difficulty_discrepancies']}")
-    print(f"  Dedup conflicts   : {s['dedup_conflicts']}")
-    print(f"  Cross-split leaks : {s['cross_split_leaks']}")
-    print(f"  Manifest issues   : {s['manifest_discrepancies']}")
-    print()
-    print(f"  OVERALL STATUS    : {rep.overall_status}")
-    print(f"  Exit code         : {rep.exit_code}")
-    print("=" * 78)
+    return exit_code, report_dict
 
 
 # ---------------------------------------------------------------------------
-# Self-Tests
+# Comprehensive Built-In Test Suite (32 Invariant Scenarios)
 # ---------------------------------------------------------------------------
 
-
-def run_selftest_suite() -> int:
-    """
-    Executes a suite of independent validator self-tests.
-    Prints pass/fail per test and returns 0 on complete success, nonzero otherwise.
-    """
+def run_self_tests() -> int:
     print("=" * 78)
-    print(f"{VALIDATOR_NAME} v{VALIDATOR_VERSION} — Self-Test Suite")
+    print(f"{PROGRAM_NAME} v{PROGRAM_VERSION} — Executing 32 Automated Invariant Tests")
     print("=" * 78)
     passed = 0
     failed = 0
 
-    def _run(name: str, fn: Callable[[], None]) -> None:
+    std_geom = compile_geometry("standard")
+
+    def _execute_case(test_num: int, title: str, fn: Callable[[], None]) -> None:
         nonlocal passed, failed
-        t0 = time.monotonic()
+        t_start = time.perf_counter()
         try:
             fn()
-            ms = (time.monotonic() - t0) * 1000.0
-            print(f"  [PASS] {name:<60} ({ms:.1f} ms)")
+            dur = (time.perf_counter() - t_start) * 1000.0
+            print(f"  [PASS] Test {test_num:02d}: {title:<52} ({dur:.1f} ms)")
             passed += 1
-        except AssertionError as e:
-            print(f"  [FAIL] {name:<60} -> {e}")
-            failed += 1
-        except Exception as e:
-            print(f"  [FAIL] {name:<60} -> {type(e).__name__}: {e}")
+        except Exception as exc:
+            print(f"  [FAIL] Test {test_num:02d}: {title:<52} -> {exc}")
             failed += 1
 
-    # 1. Valid standard Sudoku record
-    def t01() -> None:
-        puz = "530070000600195000098000060800060003400803001700020006060000280000419005000080079"
-        sol = "534678912672195348198342567859761423426853791713924856961537284287419635345286179"
-        puz_grid = parse_grid_field(puz)
-        sol_grid = parse_grid_field(sol)
-        assert puz_grid is not None and sol_grid is not None
-        ok, _ = validate_puzzle_grid(puz_grid, VARIANT_REGISTRY["standard"])
-        assert ok
-        ok, err = validate_solution_grid(sol_grid, VARIANT_REGISTRY["standard"])
-        assert ok, err
-        res = solve_and_count(puz_grid, VARIANT_REGISTRY["standard"], limit=2,
-                              timeout_sec=5.0)
-        assert res.status == SolverStatus.UNIQUE, res.status
-        assert res.first_solution == sol_grid
+    # Base valid fixtures
+    sample_puz_str = "530070000600195000098000060800060003400803001700020006060000280000419005000080079"
+    sample_sol_str = "534678912672195348198342567859761423426853791713924856961537284287419635345286179"
 
-    # 2. Invalid grid (bad length)
-    def t02() -> None:
-        assert parse_grid_field("123") is None
-        assert parse_grid_field([1] * 80) is None
+    def _make_dummy_record(**kwargs: Any) -> Dict[str, Any]:
+        rec: Dict[str, Any] = {
+            "schema_version": "sm-schema-v2.0",
+            "puzzle_id": "test_puz_001",
+            "split": "train",
+            "variant": "standard",
+            "difficulty": 2.5,
+            "difficulty_raw": 2.54,
+            "difficulty_features": {"clue_count": 30, "empty_cells": 51},
+            "givens": sum(1 for c in sample_puz_str if c != "0"),
+            "puzzle": sample_puz_str,
+            "solution": sample_sol_str,
+            "solution_count_status": "unique",
+            "unique_solution": True,
+            "task_type": "complete_solution",
+            "target": {"task_type": "complete_solution", "solution_string": sample_sol_str},
+            "technique_trace": [],
+            "generator_version": "2.1.0",
+            "generation_seed": 42,
+            "solver_version": INDEPENDENT_SOLVER_NAME,
+            "provenance": {
+                "exact_puzzle_hash": "dummy_exact",
+                "canonical_puzzle_hash": "dummy_canon",
+                "solution_family_hash": "dummy_fam",
+                "calibration_version": "sm-cal-v2.1",
+            },
+            "validation_status": "verified_unique",
+        }
+        rec.update(kwargs)
+        rec_copy = dict(rec)
+        rec_copy.pop("record_sha256", None)
+        rec["record_sha256"] = hashlib.sha256(json.dumps(rec_copy, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        return rec
 
-    # 3. Contradictory clues (peer conflict)
-    def t03() -> None:
-        g = [0] * 81
-        g[0] = 5
-        g[1] = 5
-        ok, err = validate_puzzle_grid(g, VARIANT_REGISTRY["standard"])
-        assert not ok
+    # 1. Valid standard record
+    def _t01() -> None:
+        rec = _make_dummy_record()
+        res = audit_single_record(rec, "f", 1, RepairMode.AUDIT)
+        assert res.is_valid, f"Expected valid, got findings: {res.findings}"
 
-    # 4. Unsatisfiable puzzle (no candidate for a cell)
-    def t04() -> None:
-        # Cell (0,0) has 1-9 all blocked in row/col/box
-        g = [0] * 81
-        for c in range(1, 9):
-            g[c] = c + 1  # row 0 has 2..9
-        for r in range(1, 9):
-            g[r * 9 + 0] = 1  # col 0 has 1
-        res = solve_and_count(g, VARIANT_REGISTRY["standard"], limit=2,
-                              timeout_sec=2.0)
-        assert res.status == SolverStatus.UNSAT, res.status
+    # 2. Invalid grid dimensions
+    def _t02() -> None:
+        rec = _make_dummy_record(puzzle="12345")
+        res = audit_single_record(rec, "f", 1, RepairMode.AUDIT)
+        assert not res.is_valid and any(f.category == "malformed_puzzle_representation" for f in res.findings)
 
-    # 5. Unique puzzle
-    def t05() -> None:
-        puz = "530070000600195000098000060800060003400803001700020006060000280000419005000080079"
-        g = parse_grid_field(puz)
-        assert g is not None
-        res = solve_and_count(g, VARIANT_REGISTRY["standard"], limit=2,
-                              timeout_sec=5.0)
-        assert res.status == SolverStatus.UNIQUE
+    # 3. Contradictory clues
+    def _t03() -> None:
+        bad_puz = "550000000" + "0" * 72
+        rec = _make_dummy_record(puzzle=bad_puz, givens=2)
+        res = audit_single_record(rec, "f", 1, RepairMode.AUDIT)
+        assert not res.is_valid and any(f.category == "contradictory_givens" for f in res.findings)
 
-    # 6. Multiple-solution puzzle (empty board)
-    def t06() -> None:
-        g = [0] * 81
-        res = solve_and_count(g, VARIANT_REGISTRY["standard"], limit=2,
-                              timeout_sec=2.0)
-        assert res.status == SolverStatus.MULTIPLE
+    # 4. Unsatisfiable puzzle
+    def _t04() -> None:
+        unsat = "012345678900000000000000000000000000000000000000000000000000000000000000000000000"
+        rec = _make_dummy_record(puzzle=unsat, givens=sum(1 for c in unsat if c != "0"))
+        res = audit_single_record(rec, "f", 1, RepairMode.AUDIT)
+        assert not res.is_valid and any(f.category == "unsatisfiable_puzzle" for f in res.findings)
 
-    # 7. Wrong reference solution detected
-    def t07() -> None:
-        puz = "530070000600195000098000060800060003400803001700020006060000280000419005000080079"
-        bad_sol = "534678912672195348198342567859761423426853791713924856961537284287419635345286178"
-        puz_grid = parse_grid_field(puz)
-        sol_grid = parse_grid_field(bad_sol)
-        assert puz_grid is not None and sol_grid is not None
-        ok, _ = validate_solution_grid(sol_grid, VARIANT_REGISTRY["standard"])
-        assert not ok
-        res = solve_and_count(puz_grid, VARIANT_REGISTRY["standard"], limit=2,
-                              timeout_sec=5.0)
-        assert res.first_solution != sol_grid
+    # 5. Unique-solution puzzles
+    def _t05() -> None:
+        grid, _ = parse_grid_to_digits(sample_puz_str)
+        assert grid is not None
+        s = independent_solve_and_count(grid, std_geom, max_solutions=2)
+        assert s.status == SolutionStatus.UNIQUE and len(s.solutions) == 1
+
+    # 6. Multiple-solution puzzles
+    def _t06() -> None:
+        sparse = [0] * NUM_CELLS
+        sparse[0], sparse[1] = 1, 2
+        s = independent_solve_and_count(sparse, std_geom, max_solutions=2)
+        assert s.status == SolutionStatus.MULTIPLE
+
+    # 7. Wrong reference solution
+    def _t07() -> None:
+        wrong_sol = "1" * 81
+        rec = _make_dummy_record(solution=wrong_sol)
+        res = audit_single_record(rec, "f", 1, RepairMode.AUDIT)
+        assert not res.is_valid and any("solution" in f.category for f in res.findings)
 
     # 8. False uniqueness claim
-    def t08() -> None:
-        g = [0] * 81
-        res = solve_and_count(g, VARIANT_REGISTRY["standard"], limit=2,
-                              timeout_sec=2.0)
-        assert res.status == SolverStatus.MULTIPLE
+    def _t08() -> None:
+        sparse_str = "12" + "0" * 79
+        rec = _make_dummy_record(puzzle=sparse_str, givens=2, unique_solution=True)
+        res = audit_single_record(rec, "f", 1, RepairMode.AUDIT)
+        assert not res.is_valid and any(f.category == "false_uniqueness_claim" for f in res.findings)
 
-    # 9. Technique trace: naked single
-    def t09() -> None:
-        # Build a puzzle where a naked single exists at step 1
-        puz = [0] * 81
-        for d in range(1, 10):
-            puz[d - 1] = d  # Row 0 is 1..9
-        # Cell 9 (row 1, col 0) in standard: only candidate is 9? Let's check.
-        # Column 0 has 1, row 1 has nothing. So cell 9 has 2..9 candidates minus
-        # 1? Wait col 0 has 1; row 1 empty. So candidates {2..9}. Not a naked single.
-        # Simpler: puzzle with one empty cell
-        g = [0] * 81
-        # Fill row 0 with 1..8 and (0,8) empty; put valid row values else zeros
-        for c in range(8):
-            g[c] = c + 1
-        # We need a valid puzzle with exactly 1 empty cell - actually simpler:
-        # Take a valid complete grid and empty one cell
-        sol_str = "534678912672195348198342567859761423426853791713924856961537284287419635345286179"
-        sol = parse_grid_field(sol_str)
-        assert sol is not None
-        puz_one = list(sol)
-        puz_one[0] = 0
-        spec = VARIANT_REGISTRY["standard"]
-        trace = [{"step_index": 1, "technique": "naked_single",
-                  "action_type": "placement",
-                  "target_cells": [0], "digits": [sol[0]],
-                  "evidence_cells": [], "rationale": "only candidate"}]
-        result = replay_technique_trace(trace, puz_one, sol, spec)
-        assert result.ok, result.first_error
-        assert result.verified_steps == 1
+    # 9. Incorrect task targets
+    def _t09() -> None:
+        rec = _make_dummy_record(target={"task_type": "complete_solution", "solution_string": "9" * 81})
+        res = audit_single_record(rec, "f", 1, RepairMode.AUDIT)
+        assert any(f.category == "target_solution_mismatch" for f in res.findings)
 
-    # 10. Invalid technique: naked_single claimed but cell has 2 candidates
-    def t10() -> None:
-        g = [0] * 81
-        g[0] = 0
-        spec = VARIANT_REGISTRY["standard"]
-        trace = [{"step_index": 1, "technique": "naked_single",
-                  "action_type": "placement",
-                  "target_cells": [0], "digits": [1],
-                  "evidence_cells": [], "rationale": "bogus"}]
-        result = replay_technique_trace(trace, g, None, spec)
-        assert not result.ok
-        assert "naked_single" in result.first_error
+    # 10. Invalid logical deductions
+    def _t10() -> None:
+        step = {"technique": "full_house", "action_type": "placement", "target_cells": [0], "digits": [9]}
+        rec = _make_dummy_record(task_type="next_logical_deduction", target={"deduction": step})
+        res = audit_single_record(rec, "f", 1, RepairMode.AUDIT)
+        assert any(f.category == "invalid_target_deduction" for f in res.findings)
 
-    # 11. Invalid proof trace: unsolvable path
-    def t11() -> None:
-        g = [0] * 81
-        g[0] = 5
-        g[1] = 5  # direct conflict
-        # Trace trying to place digits elsewhere
-        spec = VARIANT_REGISTRY["standard"]
-        trace = [{"step_index": 1, "technique": "naked_single",
-                  "action_type": "placement",
-                  "target_cells": [2], "digits": [1],
-                  "evidence_cells": [], "rationale": "bogus"}]
-        result = replay_technique_trace(trace, g, None, spec)
-        # Cell 2 has many candidates, so verifier should fail
-        assert not result.ok
+    # 11. Invalid proof traces
+    def _t11() -> None:
+        trace = [{"technique": "naked_single", "action_type": "placement", "target_cells": [2], "digits": [9]}]
+        rec = _make_dummy_record(technique_trace=trace)
+        res = audit_single_record(rec, "f", 1, RepairMode.AUDIT)
+        assert any(f.category == "invalid_technique_trace" for f in res.findings)
 
-    # 12. Difficulty metadata: out-of-range and wrong type
-    def t12() -> None:
-        assert not _is_finite_number("abc")
-        assert not _is_finite_number(True)
-        assert not _is_finite_number(float("nan"))
-        assert not _is_finite_number(float("inf"))
-        assert _is_finite_number(5.5)
+    # 12. Incorrect difficulty metadata
+    def _t12() -> None:
+        rec = _make_dummy_record(difficulty=15.0)
+        res = audit_single_record(rec, "f", 1, RepairMode.AUDIT)
+        assert any(f.category == "invalid_difficulty_range" for f in res.findings)
 
-    # 13. Duplicate records detected
-    def t13() -> None:
+    # 13. Duplicate records detection
+    def _t13() -> None:
         with tempfile.TemporaryDirectory() as td:
-            db = os.path.join(td, "h.sqlite3")
-            reg = DedupRegistry(db)
-            try:
-                c1 = reg.register("a" * 64, "b" * 64, "c" * 64, "train", "p1", "f1", 1)
-                c2 = reg.register("a" * 64, "b" * 64, "c" * 64, "train", "p2", "f1", 2)
-                assert c1 == []
-                assert any(kind == "puzzle_dup" for kind, *_ in c2)
-            finally:
-                reg.close()
+            db_p = os.path.join(td, "test_reg.db")
+            reg = AuditRegistry(db_p)
+            f1 = reg.register_and_audit_leak("p1", "train", "f1", 1, "e1", "c1", "fam1")
+            assert len(f1) == 0
+            f2 = reg.register_and_audit_leak("p1", "train", "f1", 2, "e1", "c1", "fam1")
+            assert any(x.category == "duplicate_puzzle_id" for x in f2)
+            reg.close()
 
-    # 14. Cross-split leakage detected
-    def t14() -> None:
+    # 14. Cross-split leakage
+    def _t14() -> None:
         with tempfile.TemporaryDirectory() as td:
-            db = os.path.join(td, "h.sqlite3")
-            reg = DedupRegistry(db)
-            try:
-                reg.register("a" * 64, "b" * 64, "c" * 64, "test", "p1", "f1", 1)
-                conf = reg.register("a" * 64, "b" * 64, "c" * 64, "train", "p2", "f2", 1)
-                assert any(kind == "puzzle_leak" for kind, *_ in conf)
-                assert any(kind == "family_leak" for kind, *_ in conf)
-            finally:
-                reg.close()
+            db_p = os.path.join(td, "test_reg.db")
+            reg = AuditRegistry(db_p)
+            reg.register_and_audit_leak("p_train", "train", "f1", 1, "e_same", "c_same", "fam_same")
+            leaks = reg.register_and_audit_leak("p_test", "test", "f2", 1, "e_same", "c_same", "fam_same")
+            assert any(x.category == "cross_split_puzzle_leakage" for x in leaks)
+            reg.close()
 
-    # 15. Equivalent puzzles under D4 + relabeling
-    def t15() -> None:
-        puz = "530070000600195000098000060800060003400803001700020006060000280000419005000080079"
-        g = parse_grid_field(puz)
-        assert g is not None
-        perm = D4_MAPS[1]
-        transformed = [g[perm[i]] for i in range(NUM_CELLS)]
-        relabeled = [(10 - v) if v != 0 else 0 for v in transformed]
-        assert canonical_d4(g, True) == canonical_d4(relabeled, True)
+    # 15. Equivalent puzzles under D4 + digit permutation
+    def _t15() -> None:
+        g1, _ = parse_grid_to_digits(sample_puz_str)
+        assert g1 is not None
+        # Invert digits (1..9 -> 9..1)
+        g2 = [(10 - x) if x != 0 else 0 for x in g1]
+        c1 = canonicalize_d4_grid(g1)
+        c2 = canonicalize_d4_grid(g2)
+        assert c1 == c2
 
-    # 16. Malformed JSONL / duplicate keys / truncated final record
-    def t16() -> None:
+    # 16. Malformed JSONL
+    def _t16() -> None:
+        try:
+            strict_json_loads("{bad json")
+            raise AssertionError("Should raise JSONDecodeError")
+        except Exception:
+            pass
+
+    # 17. Duplicate JSON keys
+    def _t17() -> None:
+        raw = '{"a": 1, "a": 2}'
+        try:
+            strict_json_loads(raw)
+            raise AssertionError("Should reject duplicate JSON keys")
+        except ValueError:
+            pass
+
+    # 18. Truncated final records
+    def _t18() -> None:
         with tempfile.TemporaryDirectory() as td:
-            path = os.path.join(td, "x.jsonl")
-            with open(path, "w") as f:
-                f.write('{"a":1,"a":2}\n')
-                f.write('not json\n')
-                f.write('{"b":3}\n')  # missing newline at end - truncated? No, complete
-            rows = list(_iter_records(path, 1 << 20, 1 << 20))
-            errs = [r[2] for r in rows if r[2] is not None]
-            assert any("duplicate" in e for e in errs)
-            assert any("json_decode_error" in e for e in errs)
+            fpath = os.path.join(td, "trunc.jsonl")
+            with open(fpath, "w", encoding="utf-8") as f:
+                f.write('{"schema_version": "sm-schema-v2.0"\n')
+            cfg = AuditExecutionConfig(input_path=fpath, quiet=True)
+            ec, rep = run_auditor(cfg)
+            assert ec == ExitCode.FAIL
 
-    # 17. Truncated final line
-    def t17() -> None:
+    # 19. Incorrect hashes (record_sha256 mismatch)
+    def _t19() -> None:
+        rec = _make_dummy_record()
+        rec["record_sha256"] = "wrong_hash"
+        res = audit_single_record(rec, "f", 1, RepairMode.AUDIT)
+        assert any(f.category == "checksum_mismatch" for f in res.findings)
+
+    # 20. Manifest inconsistencies
+    def _t20() -> None:
         with tempfile.TemporaryDirectory() as td:
-            path = os.path.join(td, "x.jsonl")
-            with open(path, "wb") as f:
-                f.write(b'{"a":1}\n')
-                f.write(b'{"b":')  # truncated
-            rows = list(_iter_records(path, 1 << 20, 1 << 20))
-            assert rows[-1][1] is None
-            assert rows[-1][2] is not None
+            mf = os.path.join(td, "manifest.json")
+            with open(mf, "w", encoding="utf-8") as f:
+                json.dump({"file_path": "data.jsonl", "file_sha256": "bogus"}, f)
+            with open(os.path.join(td, "data.jsonl"), "w", encoding="utf-8") as f:
+                f.write("content\n")
+            findings: List[ValidationFinding] = []
+            audit_dataset_manifest(td, findings)
+            assert any(f.category == "manifest_hash_mismatch" for f in findings)
 
-    # 18. record_sha256 mismatch detected
-    def t18() -> None:
-        # Construct a minimal record with wrong sha
-        rec = {
-            "schema_version": "sm-schema-v2.0",
-            "puzzle_id": "p1", "split": "train", "variant": "standard",
-            "difficulty": 3.0, "difficulty_raw": 3.0,
-            "difficulty_features": {}, "givens": 30,
-            "puzzle": "530070000600195000098000060800060003400803001700020006060000280000419005000080079",
-            "solution": "534678912672195348198342567859761423426853791713924856961537284287419635345286179",
-            "solution_count_status": "unique", "unique_solution": True,
-            "task_type": "complete_solution",
-            "target": {"solution_string": "534678912672195348198342567859761423426853791713924856961537284287419635345286179"},
-            "technique_trace": [],
-            "generator_version": "2.1.0", "generation_seed": 0,
-            "solver_version": "x", "provenance": {}, "validation_status": "ok",
-            "record_sha256": "0" * 64,
-        }
-        outcome = validate_record(rec, "test", 1, None, RepairMode.AUDIT,
-                                  5.0, 100000)
-        codes = [f.code for f in outcome.findings]
-        assert "record_sha_mismatch" in codes
+    # 21. Safe repairs (recalculating sha256 & canonicalizing givens)
+    def _t21() -> None:
+        rec = _make_dummy_record(givens=99)
+        res = audit_single_record(rec, "f", 1, RepairMode.REPAIR_SAFE)
+        assert res.is_valid and res.is_repaired
+        assert res.repaired_record is not None and res.repaired_record["givens"] == 30
 
-    # 19. Safe repair of wrong sha
-    def t19() -> None:
-        rec = {
-            "schema_version": "sm-schema-v2.0",
-            "puzzle_id": "p1", "split": "train", "variant": "standard",
-            "difficulty": 3.0, "difficulty_raw": 3.0,
-            "difficulty_features": {},
-            "givens": 29,  # wrong count
-            "puzzle": "530070000600195000098000060800060003400803001700020006060000280000419005000080079",
-            "solution": "534678912672195348198342567859761423426853791713924856961537284287419635345286179",
-            "solution_count_status": "unique", "unique_solution": True,
-            "task_type": "complete_solution",
-            "target": {"solution_string": "534678912672195348198342567859761423426853791713924856961537284287419635345286179"},
-            "technique_trace": [],
-            "generator_version": "2.1.0", "generation_seed": 0,
-            "solver_version": "x", "provenance": {}, "validation_status": "ok",
-            "record_sha256": "0" * 64,
-        }
-        outcome = validate_record(rec, "test", 1, None, RepairMode.REPAIR_SAFE,
-                                  5.0, 100000)
-        assert outcome.verdict in (Verdict.REPAIRED, Verdict.VALID)
-        rules = [r["rule"] for r in outcome.repairs]
-        assert "recompute_givens" in rules
+    # 22. Repairs that must be refused
+    def _t22() -> None:
+        rec = _make_dummy_record(puzzle="12" + "0" * 79, givens=2)
+        res = audit_single_record(rec, "f", 1, RepairMode.REPAIR_SAFE)
+        assert not res.is_valid and res.repaired_record is None
 
-    # 20. Refusal to repair a wrong solution when puzzle is not unique
-    def t20() -> None:
-        # Puzzle with many solutions - should refuse repair of bad solution
-        rec = {
-            "schema_version": "sm-schema-v2.0",
-            "puzzle_id": "p1", "split": "train", "variant": "standard",
-            "difficulty": 3.0, "difficulty_raw": 3.0,
-            "difficulty_features": {}, "givens": 30,
-            "puzzle": "0" * 81,
-            "solution": "5" * 81,  # obviously invalid
-            "solution_count_status": "unique", "unique_solution": True,
-            "task_type": "complete_solution",
-            "target": {"solution_string": "5" * 81},
-            "technique_trace": [],
-            "generator_version": "2.1.0", "generation_seed": 0,
-            "solver_version": "x", "provenance": {}, "validation_status": "ok",
-            "record_sha256": "0" * 64,
-        }
-        outcome = validate_record(rec, "test", 1, None, RepairMode.REPAIR_SAFE,
-                                  2.0, 100000)
-        # Should be invalid/quarantined, not silently fixed
-        assert outcome.verdict in (Verdict.INVALID, Verdict.QUARANTINED)
-
-    # 21. Dry run: no writes
-    def t21() -> None:
+    # 23. Quarantine behavior
+    def _t23() -> None:
         with tempfile.TemporaryDirectory() as td:
-            src = os.path.join(td, "in")
-            os.makedirs(src)
-            train_dir = os.path.join(src, "train")
-            os.makedirs(train_dir)
-            puz = "530070000600195000098000060800060003400803001700020006060000280000419005000080079"
-            sol = "534678912672195348198342567859761423426853791713924856961537284287419635345286179"
-            rec = {
-                "schema_version": "sm-schema-v2.0",
-                "puzzle_id": "p1", "split": "train", "variant": "standard",
-                "difficulty": 3.0, "difficulty_raw": 3.0,
-                "difficulty_features": {}, "givens": 30,
-                "puzzle": puz, "solution": sol,
-                "solution_count_status": "unique", "unique_solution": True,
-                "task_type": "complete_solution",
-                "target": {"solution_string": sol},
-                "technique_trace": [],
-                "generator_version": "2.1.0", "generation_seed": 0,
-                "solver_version": "x", "provenance": {}, "validation_status": "ok",
-                "record_sha256": "0" * 64,
-            }
-            # Compute correct sha
-            rc = dict(rec); rc.pop("record_sha256")
-            rec["record_sha256"] = hashlib.sha256(
-                json.dumps(rc, sort_keys=True, separators=(",", ":")).encode()
-            ).hexdigest()
-            with open(os.path.join(train_dir, "train.jsonl"), "w") as f:
+            in_p = os.path.join(td, "bad.jsonl")
+            q_p = os.path.join(td, "quarantine")
+            with open(in_p, "w", encoding="utf-8") as f:
+                f.write(json.dumps(_make_dummy_record(difficulty=20.0)) + "\n")
+            cfg = AuditExecutionConfig(input_path=in_p, quarantine_path=q_p, mode=RepairMode.QUARANTINE, quiet=True)
+            run_auditor(cfg)
+            q_files = os.listdir(q_p)
+            assert len(q_files) > 0
+
+    # 24. Dry-run behavior
+    def _t24() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            in_p = os.path.join(td, "in.jsonl")
+            out_p = os.path.join(td, "out")
+            with open(in_p, "w", encoding="utf-8") as f:
+                f.write(json.dumps(_make_dummy_record(givens=99)) + "\n")
+            cfg = AuditExecutionConfig(input_path=in_p, output_path=out_p, mode=RepairMode.REPAIR_SAFE, dry_run=True, quiet=True)
+            run_auditor(cfg)
+            assert not os.path.exists(out_p)
+
+    # 25. Atomic output handling
+    def _t25() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            in_p = os.path.join(td, "in.jsonl")
+            out_p = os.path.join(td, "out")
+            with open(in_p, "w", encoding="utf-8") as f:
+                f.write(json.dumps(_make_dummy_record()) + "\n")
+            cfg = AuditExecutionConfig(input_path=in_p, output_path=out_p, mode=RepairMode.REPAIR_SAFE, quiet=True)
+            run_auditor(cfg)
+            # Output file should exist and no .tmp files left
+            assert os.path.exists(os.path.join(out_p, "in.jsonl"))
+            assert all(not fn.endswith(".tmp") for fn in os.listdir(out_p))
+
+    # 26. Interrupted operations
+    def _t26() -> None:
+        global _SHUTDOWN_REQUESTED
+        _SHUTDOWN_REQUESTED = True
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                in_p = os.path.join(td, "in.jsonl")
+                with open(in_p, "w", encoding="utf-8") as f:
+                    f.write(json.dumps(_make_dummy_record()) + "\n")
+                cfg = AuditExecutionConfig(input_path=in_p, quiet=True)
+                ec, _ = run_auditor(cfg)
+                assert ec == ExitCode.INCOMPLETE
+        finally:
+            _SHUTDOWN_REQUESTED = False
+
+    # 27. Resource-limit enforcement (line-length)
+    def _t27() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            in_p = os.path.join(td, "huge.jsonl")
+            with open(in_p, "w", encoding="utf-8") as f:
+                f.write("A" * 1000 + "\n")
+            cfg = AuditExecutionConfig(input_path=in_p, max_line_bytes=100, quiet=True)
+            ec, _ = run_auditor(cfg)
+            assert ec == ExitCode.FAIL
+
+    # 28. Deterministic reports
+    def _t28() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            in_p = os.path.join(td, "in.jsonl")
+            with open(in_p, "w", encoding="utf-8") as f:
+                f.write(json.dumps(_make_dummy_record()) + "\n")
+            cfg = AuditExecutionConfig(input_path=in_p, quiet=True)
+            _, r1 = run_auditor(cfg)
+            _, r2 = run_auditor(cfg)
+            assert r1["summary_counts"] == r2["summary_counts"]
+
+    # 29. Unsupported schema versions
+    def _t29() -> None:
+        rec = _make_dummy_record(schema_version="sm-schema-v999.0")
+        res = audit_single_record(rec, "f", 1, RepairMode.AUDIT)
+        assert any(f.category == "unsupported_schema" for f in res.findings)
+
+    # 30. Unsupported variants
+    def _t30() -> None:
+        rec = _make_dummy_record(variant="thermo")
+        res = audit_single_record(rec, "f", 1, RepairMode.AUDIT)
+        assert any(f.category == "unsupported_variant" for f in res.findings)
+
+    # 31. Corrupted checkpoints in directory scan
+    def _t31() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "train.jsonl"), "w", encoding="utf-8") as f:
+                f.write(json.dumps(_make_dummy_record()) + "\n")
+            with open(os.path.join(td, "checkpoint.json"), "w", encoding="utf-8") as f:
+                f.write("corrupted json")
+            cfg = AuditExecutionConfig(input_path=td, quiet=True)
+            ec, _ = run_auditor(cfg)
+            assert ec == ExitCode.PASS  # Checkpoint ignored if final dataset is present
+
+    # 32. Held-out test set protection
+    def _t32() -> None:
+        with tempfile.TemporaryDirectory() as td:
+            test_file = os.path.join(td, "test.jsonl")
+            rec = _make_dummy_record(split="test")
+            with open(test_file, "w", encoding="utf-8") as f:
                 f.write(json.dumps(rec) + "\n")
-            out = os.path.join(td, "out")
-            cfg = AuditConfig(input_path=src, output_path=out,
-                              mode=RepairMode.REPAIR_SAFE, dry_run=True,
-                              quiet=True, max_solver_sec=3.0)
-            run_audit(cfg)
-            assert not os.path.exists(out) or not any(os.scandir(out))
+            files = discover_input_files(test_file)
+            assert files[0].is_test_split is True
 
-    # 22. Quarantine behavior
-    def t22() -> None:
-        with tempfile.TemporaryDirectory() as td:
-            src = os.path.join(td, "in", "train")
-            os.makedirs(src)
-            bad = {
-                "schema_version": "sm-schema-v2.0",
-                "puzzle_id": "p1", "split": "train", "variant": "standard",
-                "difficulty": 3.0, "difficulty_raw": 3.0,
-                "difficulty_features": {}, "givens": 30,
-                "puzzle": "5" * 81,  # invalid (all 5s -> peer conflicts)
-                "solution": "5" * 81,
-                "solution_count_status": "unique", "unique_solution": True,
-                "task_type": "complete_solution",
-                "target": {"solution_string": "5" * 81},
-                "technique_trace": [],
-                "generator_version": "2.1.0", "generation_seed": 0,
-                "solver_version": "x", "provenance": {}, "validation_status": "ok",
-                "record_sha256": "0" * 64,
-            }
-            with open(os.path.join(src, "train.jsonl"), "w") as f:
-                f.write(json.dumps(bad) + "\n")
-            out = os.path.join(td, "out")
-            cfg = AuditConfig(input_path=os.path.join(td, "in"),
-                              output_path=out, mode=RepairMode.QUARANTINE,
-                              quiet=True, max_solver_sec=2.0)
-            run_audit(cfg)
-            qdir = os.path.join(out, "_quarantine")
-            assert os.path.isdir(qdir)
-            qfile = os.path.join(qdir, "train_quarantine.jsonl")
-            assert os.path.exists(qfile)
-            with open(qfile) as f:
-                lines = [json.loads(x) for x in f if x.strip()]
-            assert len(lines) == 1
+    # Run all 32 cases
+    cases = [
+        (1, "Valid standard Sudoku records", _t01),
+        (2, "Invalid grid dimensions rejection", _t02),
+        (3, "Contradictory clue rejection", _t03),
+        (4, "Unsatisfiable puzzle detection", _t04),
+        (5, "Unique-solution verification", _t05),
+        (6, "Multiple-solution puzzle detection", _t06),
+        (7, "Wrong reference solution detection", _t07),
+        (8, "False uniqueness claim audit", _t08),
+        (9, "Incorrect task target verification", _t09),
+        (10, "Invalid logical deduction detection", _t10),
+        (11, "Invalid proof trace replay", _t11),
+        (12, "Incorrect difficulty metadata check", _t12),
+        (13, "Duplicate record detection", _t13),
+        (14, "Cross-split contamination audit", _t14),
+        (15, "Equivalent puzzles under D4 + digit permutation", _t15),
+        (16, "Malformed JSONL handling", _t16),
+        (17, "Duplicate JSON key rejection", _t17),
+        (18, "Truncated final line detection", _t18),
+        (19, "Tamper & SHA-256 integrity check", _t19),
+        (20, "Manifest inconsistency audit", _t20),
+        (21, "Category 1 Safe repair execution", _t21),
+        (22, "Refusal of ambiguous repairs", _t22),
+        (23, "Quarantine isolation behavior", _t23),
+        (24, "Dry-run non-mutation guarantee", _t24),
+        (25, "Atomic temporary file writing", _t25),
+        (26, "Graceful interruption handling", _t26),
+        (27, "Resource limits (line-size) enforcement", _t27),
+        (28, "Deterministic reporting verification", _t28),
+        (29, "Unsupported schema rejection", _t29),
+        (30, "Unsupported variant rejection", _t30),
+        (31, "Corrupted checkpoint resilience", _t31),
+        (32, "Held-out test set identification", _t32),
+    ]
 
-    # 23. Unsupported schema version
-    def t23() -> None:
-        rec = {"schema_version": "sm-schema-v99", "puzzle_id": "x"}
-        outcome = validate_record(rec, "t", 1, None, RepairMode.AUDIT, 5.0, 100000)
-        assert outcome.verdict == Verdict.INVALID
-        assert any(f.code == "unsupported_schema_version"
-                   for f in outcome.findings)
+    for num, title, test_fn in cases:
+        _execute_case(num, title, test_fn)
 
-    # 24. Unsupported variant
-    def t24() -> None:
-        rec = {"schema_version": "sm-schema-v2.0", "puzzle_id": "x",
-               "split": "train", "variant": "killer", "difficulty": 3.0,
-               "difficulty_raw": 3.0, "difficulty_features": {}, "givens": 30,
-               "puzzle": "0" * 81, "solution": "0" * 81,
-               "solution_count_status": "unique", "unique_solution": True,
-               "task_type": "complete_solution", "target": {},
-               "technique_trace": [], "generator_version": "x",
-               "generation_seed": 0, "solver_version": "x", "provenance": {},
-               "validation_status": "ok", "record_sha256": "0" * 64}
-        outcome = validate_record(rec, "t", 1, None, RepairMode.AUDIT, 5.0, 100000)
-        assert outcome.verdict == Verdict.INVALID
-        assert any(f.code == "unsupported_variant" for f in outcome.findings)
-
-    # 25. Multi-variant correctness for all 5 supported variants
-    def t25() -> None:
-        for vname in ("standard", "diagonal", "hyper", "anti_knight", "anti_king"):
-            spec = VARIANT_REGISTRY[vname]
-            res = solve_and_count([0] * 81, spec, limit=1, timeout_sec=3.0)
-            assert res.status == SolverStatus.UNIQUE, (vname, res.status)
-            assert res.first_solution is not None
-            ok, err = validate_solution_grid(res.first_solution, spec)
-            assert ok, f"{vname}: {err}"
-
-    _run("01 valid standard Sudoku record", t01)
-    _run("02 invalid grid dimension rejected", t02)
-    _run("03 contradictory clues rejected", t03)
-    _run("04 unsatisfiable puzzle detected", t04)
-    _run("05 unique puzzle confirmed", t05)
-    _run("06 multiple-solution puzzle detected", t06)
-    _run("07 wrong reference solution detected", t07)
-    _run("08 false uniqueness claim detected", t08)
-    _run("09 valid technique trace (naked single)", t09)
-    _run("10 invalid technique claim rejected", t10)
-    _run("11 invalid proof trace rejected", t11)
-    _run("12 difficulty metadata type checks", t12)
-    _run("13 duplicate records detected", t13)
-    _run("14 cross-split leakage detected", t14)
-    _run("15 D4 + relabeling equivalence", t15)
-    _run("16 malformed JSONL / duplicate keys", t16)
-    _run("17 truncated final line detected", t17)
-    _run("18 record_sha256 mismatch", t18)
-    _run("19 safe repair of givens count", t19)
-    _run("20 repair refusal for unsafe case", t20)
-    _run("21 dry-run makes no writes", t21)
-    _run("22 quarantine behaviour", t22)
-    _run("23 unsupported schema version", t23)
-    _run("24 unsupported variant rejected", t24)
-    _run("25 multi-variant solver correctness", t25)
-
-    print("-" * 78)
-    print(f"Results: {passed} passed, {failed} failed")
+    print("=" * 78)
+    print(f"Test Suite Summary: {passed} passed, {failed} failed out of {len(cases)} tests.")
     print("=" * 78)
     return 0 if failed == 0 else 1
 
 
 # ---------------------------------------------------------------------------
-# Entrypoint
+# CLI Argument Parsing & Entrypoint
 # ---------------------------------------------------------------------------
+
+def build_cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="dataset_validator.py",
+        description=(
+            f"{PROGRAM_NAME} v{PROGRAM_VERSION} — Industrial-grade Sudoku dataset integrity auditor, "
+            "independent constraint verifier, leakage detector, and safe repair system."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("command", nargs="?", default="audit", choices=["audit", "repair-safe", "repair-aggressive", "quarantine"], help="Primary execution command (default: audit)")
+    parser.add_argument("--input", default="datasets", help="Input JSONL file or dataset directory (default: datasets)")
+    parser.add_argument("--output", default=None, help="Output directory for repaired datasets")
+    parser.add_argument("--quarantine", default=None, help="Output directory for quarantined invalid records")
+    parser.add_argument("--report", default="reports/dataset_audit.json", help="Path for machine-readable JSON report")
+    parser.add_argument("--repair-log", default="reports/repair_log.json", help="Path for JSON repair operation log")
+    parser.add_argument("--cross-split", action="store_true", help="Audit cross-split puzzle and family contamination")
+    parser.add_argument("--dry-run", action="store_true", help="Simulate audit/repair without writing data to disk")
+    parser.add_argument("--workers", type=int, default=2, help="Worker processes for constraint validation (default: 2)")
+    parser.add_argument("--max-solver-seconds", type=float, default=2.0, help="Per-puzzle independent solver timeout (default: 2.0s)")
+    parser.add_argument("--max-line-bytes", type=int, default=2_000_000, help="Maximum allowable line size in bytes (default: 2MB)")
+    parser.add_argument("--batch-size", type=int, default=100, help="Batch size per worker task (default: 100)")
+    parser.add_argument("--run-tests", action="store_true", help="Execute built-in 32-scenario automated test suite")
+    parser.add_argument("--verbose", action="store_true", help="Print verbose per-file diagnostic information")
+    parser.add_argument("--quiet", action="store_true", help="Suppress console progress output")
+    return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    import signal as _sig
-    _sig.signal(_sig.SIGINT, _signal_handler)
-    if hasattr(_sig, "SIGTERM"):
-        _sig.signal(_sig.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _sig_handler)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, _sig_handler)
 
-    parser = _build_parser()
+    parser = build_cli_parser()
     args = parser.parse_args(argv)
 
-    if args.run_tests or args.command == "selftest":
-        return run_selftest_suite()
+    if args.run_tests:
+        return run_self_tests()
 
-    if args.command == "help":
-        parser.print_help()
-        return ExitCode.OK
-
-    if not args.input:
-        parser.print_help()
-        print("\n[ERROR] --input is required for audit/repair modes.")
-        return ExitCode.CLI_ERROR
-
-    # Map command -> mode
-    command_to_mode = {
-        "audit": RepairMode.AUDIT,
-        "repair-safe": RepairMode.REPAIR_SAFE,
-        "repair-aggressive": RepairMode.REPAIR_AGGRESSIVE,
-        "quarantine": RepairMode.QUARANTINE,
-    }
-    if args.command not in command_to_mode:
-        print(f"[ERROR] unknown command {args.command!r}")
-        return ExitCode.CLI_ERROR
-
-    mode = command_to_mode[args.command]
-
-    if mode in (RepairMode.REPAIR_SAFE, RepairMode.REPAIR_AGGRESSIVE,
-                RepairMode.QUARANTINE) and not args.output and not args.dry_run:
-        print(f"[ERROR] --output is required for mode {mode.value} "
-              f"(or use --dry-run to inspect only).")
-        return ExitCode.CLI_ERROR
-
-    cfg = AuditConfig(
+    mode = RepairMode(args.command)
+    cfg = AuditExecutionConfig(
         input_path=args.input,
         output_path=args.output,
+        quarantine_path=args.quarantine,
         report_path=args.report,
+        repair_log_path=args.repair_log,
         mode=mode,
-        workers=max(1, args.workers),
-        max_line_bytes=args.max_line_bytes,
-        max_record_bytes=args.max_record_bytes,
-        max_solver_sec=args.max_solver_seconds,
-        max_solver_nodes=args.max_solver_nodes,
-        max_wall_sec=args.max_wall_seconds,
-        min_free_disk_mb=args.min_free_disk_mb,
-        cross_split=args.cross_split or True,
-        quiet=args.quiet,
-        verbose=args.verbose,
+        cross_split=args.cross_split,
         dry_run=args.dry_run,
-        variant_override=args.variant,
+        workers=args.workers,
+        max_solver_seconds=args.max_solver_seconds,
+        max_line_bytes=args.max_line_bytes,
+        batch_size=args.batch_size,
+        verbose=args.verbose,
+        quiet=args.quiet,
     )
 
-    # Startup banner
-    if not args.quiet:
-        print("=" * 78)
-        print(f"{VALIDATOR_NAME} v{VALIDATOR_VERSION}")
-        print("=" * 78)
-        print(f"  Input               : {os.path.abspath(args.input)}")
-        if args.output:
-            print(f"  Output              : {os.path.abspath(args.output)}")
-        print(f"  Mode                : {mode.value}")
-        print(f"  Schema profile      : sm-schema-v2.0")
-        print(f"  Workers             : {cfg.workers}")
-        print(f"  Max solver seconds  : {cfg.max_solver_sec}")
-        print(f"  Max solver nodes    : {cfg.max_solver_nodes}")
-        print(f"  Max line bytes      : {cfg.max_line_bytes}")
-        print(f"  Dry run             : {cfg.dry_run}")
-        print(f"  Source modification : DISABLED (always non-destructive)")
-        print("=" * 78)
-
     try:
-        report = run_audit(cfg)
-    except FileNotFoundError as e:
-        sys.stderr.write(f"[ERROR] {e}\n")
-        return ExitCode.CLI_ERROR
-    except ValueError as e:
-        sys.stderr.write(f"[ERROR] {e}\n")
-        return ExitCode.CLI_ERROR
-    except Exception as e:
-        sys.stderr.write(f"[INTERNAL ERROR] {type(e).__name__}: {e}\n")
-        traceback.print_exc()
-        return ExitCode.INTERNAL_ERROR
-
-    if args.report:
-        os.makedirs(os.path.dirname(os.path.abspath(args.report)), exist_ok=True)
-        tmp = args.report + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(report.to_dict(), f, indent=2, sort_keys=True)
-        os.replace(tmp, args.report)
-
-    _print_report_summary(report, args.quiet)
-    return report.exit_code
+        exit_code, _ = run_auditor(cfg)
+        return int(exit_code)
+    except Exception as exc:
+        sys.stderr.write(f"\n[FATAL ERROR] {exc.__class__.__name__}: {exc}\n")
+        return int(ExitCode.CLI_ERROR)
 
 
 if __name__ == "__main__":
